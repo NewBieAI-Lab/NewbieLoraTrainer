@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from transformers import AutoModel, AutoTokenizer
+from diffusers import AutoencoderKL
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import models
@@ -34,6 +35,12 @@ def parse_args():
         type=str,
         default="jinaai/jina-clip-v2",
         help="Jina CLIP模型的HuggingFace repo或本地路径 (默认: jinaai/jina-clip-v2)"
+    )
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default="black-forest-labs/FLUX.1-dev",
+        help="VAE模型的HuggingFace repo或本地路径 (默认: black-forest-labs/FLUX.1-dev，使用其中的VAE子文件夹)"
     )
     parser.add_argument(
         "--dtype",
@@ -153,6 +160,8 @@ def load_clip_model(jina_path, dtype, hf_token=None):
     print(f"路径: {jina_path}")
     print(f"精度: {dtype}")
 
+    from transformers import AutoConfig
+
     clip_config = AutoConfig.from_pretrained(
         jina_path,
         trust_remote_code=True
@@ -174,6 +183,38 @@ def load_clip_model(jina_path, dtype, hf_token=None):
     print(f"✅ Jina CLIP加载成功")
 
     return clip_model, clip_tokenizer, clip_config
+
+
+def load_vae(vae_path, dtype, hf_token=None):
+    """加载VAE模型"""
+    print(f"\n{'='*60}")
+    print("🎨 加载VAE模型")
+    print(f"{'='*60}")
+    print(f"路径: {vae_path}")
+    print(f"精度: {dtype}")
+
+    # 检查是否是包含vae子文件夹的完整模型路径（如FLUX）
+    vae_subfolder_path = os.path.join(vae_path, "vae") if os.path.isdir(vae_path) else None
+
+    if vae_subfolder_path and os.path.exists(os.path.join(vae_subfolder_path, "config.json")):
+        print(f"检测到VAE子文件夹，从 {vae_subfolder_path} 加载")
+        vae = AutoencoderKL.from_pretrained(
+            vae_subfolder_path,
+            torch_dtype=dtype,
+            token=hf_token
+        )
+    else:
+        vae = AutoencoderKL.from_pretrained(
+            vae_path,
+            subfolder="vae" if not vae_path.endswith("vae") else None,
+            torch_dtype=dtype,
+            token=hf_token
+        )
+
+    print(f"✅ VAE加载成功")
+    print(f"📊 潜在空间通道数: {vae.config.latent_channels}")
+
+    return vae
 
 
 def create_model(model_name, cap_feat_dim, qk_norm=True):
@@ -207,6 +248,7 @@ def convert_to_diffusers(
     tokenizer,
     clip_model,
     clip_tokenizer,
+    vae,
     output_dir,
     dtype
 ):
@@ -268,15 +310,24 @@ def convert_to_diffusers(
     clip_tokenizer.save_pretrained(clip_path)
     print(f"✅ Jina CLIP已保存到: {clip_path}")
 
-    # 4. 创建模型索引和配置
+    # 4. 保存VAE
+    vae_path = output_path / "vae"
+    vae_path.mkdir(exist_ok=True)
+
+    print("\n🎨 保存VAE...")
+    vae.save_pretrained(vae_path, safe_serialization=True)
+    print(f"✅ VAE已保存到: {vae_path}")
+
+    # 5. 创建模型索引和配置
     model_index = {
         "_class_name": "NewbiePipeline",
         "_diffusers_version": "0.30.0",
-        "transformer": ["transformer", "NextDiT_CLIP"],
-        "text_encoder": ["text_encoder", "Gemma3Model"],
+        "transformer": ["transformer", "NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP"],
+        "text_encoder": ["text_encoder", "Gemma3ForConditionalGeneration"],
         "tokenizer": ["text_encoder", "AutoTokenizer"],
         "clip_model": ["clip_model", "JinaCLIPModel"],
         "clip_tokenizer": ["clip_model", "AutoTokenizer"],
+        "vae": ["vae", "AutoencoderKL"],
     }
 
     with open(output_path / "model_index.json", "w") as f:
@@ -373,6 +424,9 @@ Apache 2.0
     print(f"  │   ├── model.safetensors")
     print(f"  │   ├── config.json")
     print(f"  │   └── tokenizer files...")
+    print(f"  ├── vae/")
+    print(f"  │   ├── diffusion_pytorch_model.safetensors")
+    print(f"  │   └── config.json")
     print(f"  ├── model_index.json")
     print(f"  └── README.md")
 
@@ -439,6 +493,7 @@ def main():
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Gemma3: {args.gemma3}")
     print(f"  Jina CLIP: {args.jina}")
+    print(f"  VAE: {args.vae}")
     print(f"  精度: {args.dtype}")
     print(f"  输出目录: {output_dir}")
 
@@ -455,10 +510,13 @@ def main():
         args.jina, dtype, args.hf_token
     )
 
-    # 4. 创建DiT模型
+    # 4. 加载VAE
+    vae = load_vae(args.vae, dtype, args.hf_token)
+
+    # 5. 创建DiT模型
     model = create_model(args.model_name, cap_feat_dim)
 
-    # 5. 加载权重
+    # 6. 加载权重
     print(f"\n{'='*60}")
     print("⚙️  加载模型权重")
     print(f"{'='*60}")
@@ -480,18 +538,19 @@ def main():
     # 转换为指定精度
     model = model.to(dtype)
 
-    # 6. 转换为Diffusers格式
+    # 7. 转换为Diffusers格式
     output_path = convert_to_diffusers(
         model=model,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         clip_model=clip_model,
         clip_tokenizer=clip_tokenizer,
+        vae=vae,
         output_dir=output_dir,
         dtype=args.dtype
     )
 
-    # 7. 推送到Hub（如果需要）
+    # 8. 推送到Hub（如果需要）
     if args.push_to_hub:
         if args.hub_repo_id is None:
             print("\n❌ 错误: 需要指定 --hub_repo_id 才能推送到Hub")
