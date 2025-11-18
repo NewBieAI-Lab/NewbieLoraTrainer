@@ -725,17 +725,65 @@ class NextDiT(nn.Module):
         return imgs
 
     def patchify_and_embed(
-        self, x: List[torch.Tensor] | torch.Tensor, cap_feats: torch.Tensor, cap_mask: torch.Tensor, t: torch.Tensor
+        self, x: List[torch.Tensor] | torch.Tensor, cap_feats: torch.Tensor, cap_mask: torch.Tensor, t: torch.Tensor, use_refined_cap_feats: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]], List[int], torch.Tensor]:
-        bsz = len(x)
+        bsz = len(x) if isinstance(x, list) else x.shape[0]
         pH = pW = self.patch_size
-        device = x[0].device
+        device = x[0].device if isinstance(x, list) else x.device
 
         l_effective_cap_len = cap_mask.sum(dim=1).tolist()
-        img_sizes = [(img.size(1), img.size(2)) for img in x]
+
+        if isinstance(x, list):
+            img_sizes = [(img.size(1), img.size(2)) for img in x]
+        else:
+            img_sizes = [(x.shape[2], x.shape[3])] * bsz
+
         l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in img_sizes]
 
         same_resolution = len(set(img_sizes)) == 1
+
+        if same_resolution and use_refined_cap_feats:
+            max_cap_len = cap_feats.shape[1]
+            H, W = img_sizes[0]
+            H_tokens, W_tokens = H // pH, W // pW
+            img_len = l_effective_img_len[0]
+            max_seq_len = max_cap_len + img_len
+
+            if isinstance(x, torch.Tensor):
+                x_batch = x
+            else:
+                x_batch = torch.stack(x, dim=0)
+
+            C, H, W = x_batch.shape[1], x_batch.shape[2], x_batch.shape[3]
+            x_patches = x_batch.view(bsz, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2)
+
+            row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+
+            img_position_ids = torch.zeros(bsz, img_len, 3, dtype=torch.int32, device=device)
+            img_position_ids[:, :, 0] = max_cap_len
+            img_position_ids[:, :, 1] = row_ids.unsqueeze(0).expand(bsz, -1)
+            img_position_ids[:, :, 2] = col_ids.unsqueeze(0).expand(bsz, -1)
+            img_freqs_cis = self.rope_embedder(img_position_ids)
+
+            img_embed = self.x_embedder(x_patches)
+            img_mask = torch.ones(bsz, img_len, dtype=torch.bool, device=device)
+
+            for layer in self.noise_refiner:
+                img_embed = layer(img_embed, img_mask, img_freqs_cis, t)
+
+            full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x_patches.dtype)
+            mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
+
+            full_embed[:, :max_cap_len] = cap_feats
+            full_embed[:, max_cap_len:] = img_embed
+            mask[:, :max_cap_len] = cap_mask
+            mask[:, max_cap_len:] = True
+
+            freqs_cis = torch.zeros(bsz, max_seq_len, img_freqs_cis.shape[-1], device=device, dtype=img_freqs_cis.dtype)
+            freqs_cis[:, max_cap_len:] = img_freqs_cis
+
+            return full_embed, mask, img_sizes, [max_cap_len] * bsz, freqs_cis
 
         if same_resolution:
             H, W = img_sizes[0]
@@ -866,25 +914,15 @@ class NextDiT(nn.Module):
         return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
 
 
-    def forward(self, x, t, cap_feats, cap_mask, attn_bias=None):
-        """
-        Forward pass of NextDiT.
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of text tokens/features
-        """
-
-        # import torch.distributed as dist
-        # if not dist.is_initialized() or dist.get_rank() == 0:
-        #     import pdb
-        #     pdb.set_trace()
-            # torch.save([x, t, cap_feats, cap_mask], "./fake_input.pt")
-        t = self.t_embedder(t)  # (N, D)
+    def forward(self, x, t, cap_feats, cap_mask, attn_bias=None, use_refined_cap_feats=False):
+        t = self.t_embedder(t)
         adaln_input = t
 
-        cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+        if not use_refined_cap_feats:
+            cap_feats = self.cap_embedder(cap_feats)
 
         x_is_tensor = isinstance(x, torch.Tensor)
-        x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t)
+        x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
         for layer in self.layers:
@@ -1029,20 +1067,16 @@ class NextDiT_CLIP(NextDiT):
         nn.init.zeros_(self.clip_text_pooled_proj[1].bias)
 
 
-    def forward(self, x, t, cap_feats, cap_mask, attn_bias=None, **kwargs):
-        """
-        重写 forward 方法，以正确、优雅地整合 CLIP 特征。
-        """
-        # 从 kwargs 中提取 CLIP 特征
+    def forward(self, x, t, cap_feats, cap_mask, attn_bias=None, use_refined_cap_feats=False, **kwargs):
         clip_text_pooled = kwargs.get('clip_text_pooled')
-        clip_img_pooled = kwargs.get('clip_img_pooled') # 备用
+        clip_img_pooled = kwargs.get('clip_img_pooled')
 
-        # =================== 核心修改在这里 ===================
-
-        # 1. 准备 AdaLN 输入 (t_emb + pooled features)
         t_emb = self.t_embedder(t)
         adaln_input = t_emb
-        cap_feats = self.cap_embedder(cap_feats)
+
+        if not use_refined_cap_feats:
+            cap_feats = self.cap_embedder(cap_feats)
+
         if clip_text_pooled is not None:
             clip_emb = self.clip_text_pooled_proj(clip_text_pooled)
             combined_features = torch.cat([t_emb, clip_emb], dim=-1)
@@ -1054,16 +1088,8 @@ class NextDiT_CLIP(NextDiT):
             clip_img_pooled_emb = self.clip_img_pooled_embedder(clip_img_pooled)
             adaln_input = adaln_input + clip_img_pooled_emb
 
-
-        # =======================================================
-
-        # 准备好所有增强后的参数后，直接调用父类的 forward 方法。
-        # 父类的方法知道如何处理张量列表 x，以及如何使用 adaln_input, cap_feats, 和 cap_mask。
-        # 我们不再需要那个有问题的 _forward_with_clip 方法了。
-
-        # --- 直接调用父类的完整、健壮的 forward 逻辑 ---
         x_is_tensor = isinstance(x, torch.Tensor)
-        x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, adaln_input)
+        x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, adaln_input, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
         for layer in self.layers:
@@ -1141,202 +1167,6 @@ class NextDiT_CLIP(NextDiT):
         return output
 
 
-class ResnetBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, conv_shortcut=False):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.use_conv_shortcut = conv_shortcut
-
-        self.norm1 = nn.GroupNorm(32, in_channels, eps=1e-6)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        self.norm2 = nn.GroupNorm(32, out_channels, eps=1e-6)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-            else:
-                self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, x):
-        hidden_states = x
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = F.silu(hidden_states)
-        hidden_states = self.conv1(hidden_states)
-
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = F.silu(hidden_states)
-        hidden_states = self.conv2(hidden_states)
-
-        if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                x = self.conv_shortcut(x)
-            else:
-                x = self.nin_shortcut(x)
-
-        return x + hidden_states
-
-
-class CNNEncoder(nn.Module):
-    """简化版的SDXL编码器，只保留必要的卷积层"""
-
-    def __init__(self, in_channels=16, base_channels=128, out_channels=64):
-        super().__init__()
-
-        # Initial convolution
-        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1)
-
-        # ResNet blocks - 保持输入分辨率
-        self.resnet_blocks = nn.ModuleList([
-            ResnetBlock(base_channels, base_channels),
-            ResnetBlock(base_channels, base_channels * 2),
-            ResnetBlock(base_channels * 2, base_channels * 2),
-        ])
-
-        # Final projection to match patch dimension
-        self.conv_out = nn.Conv2d(base_channels * 2, out_channels, kernel_size=3, stride=1, padding=1)
-
-        # Initialize conv_out to zero
-        nn.init.zeros_(self.conv_out.weight)
-        nn.init.zeros_(self.conv_out.bias)
-
-    def forward(self, x):
-        # x: [B, 16, H, W] (latent space)
-        h = self.conv_in(x)
-
-        for resnet in self.resnet_blocks:
-            h = resnet(h)
-
-        # Project to patch dimension
-        h = self.conv_out(h)  # [B, 64, H, W]
-
-        return h
-
-
-class NextDiT_CLIP_CNN(NextDiT_CLIP):
-    def __init__(self, *args, **kwargs):
-        # 提取CNN相关参数
-        cnn_base_channels = kwargs.pop('cnn_base_channels', 128)
-
-        # 调用父类初始化
-        super().__init__(*args, **kwargs)
-
-        # 初始化CNN编码器
-        # out_channels需要匹配patch_size^2 * in_channels
-        #patch_dim = self.patch_size * self.patch_size * self.in_channels  # 2*2*16=64
-        self.cnn_encoder = CNNEncoder(
-            in_channels=self.in_channels,  # 16
-            base_channels=cnn_base_channels,
-            out_channels=cnn_base_channels*2  # 64
-        )
-
-        # CNN特征到embedding维度的映射（从0初始化）
-        self.cnn_proj = nn.Linear(self.patch_size * self.patch_size*cnn_base_channels * 2, self.dim, bias=True)
-        nn.init.zeros_(self.cnn_proj.weight)
-        nn.init.zeros_(self.cnn_proj.bias)
-
-    def patchify_and_embed(self, x, cap_feats, cap_mask, adaln_input):
-        """
-        最终修正版：确保对原始图像和CNN特征图使用完全相同的Patch化逻辑，
-        以处理可变尺寸输入。
-        """
-        # --- 1. 准备工作 ---
-        bsz = len(x)
-        pH = pW = self.patch_size
-        device = x[0].device
-
-        original_img_sizes = [(img.size(1), img.size(2)) for img in x]
-        l_effective_cap_len = cap_mask.sum(dim=1).tolist()
-        l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in original_img_sizes]
-        max_img_len = max(l_effective_img_len)
-
-        # --- 2. 逐个处理图像，融合特征并嵌入 ---
-        list_of_fused_embeds = []
-        for i in range(bsz):
-            img_tensor = x[i]
-            C_in, H, W = img_tensor.shape
-
-            # --- 2.1 准备原始图像Patch ---
-            # [C, H, W] -> [1, N, P*P*C]
-            raw_patches = img_tensor.view(C_in, H // pH, pH, W // pW, pW).permute(1, 3, 0, 2, 4).flatten(2)
-            raw_patches = raw_patches.flatten(0, 1).unsqueeze(0)
-
-            # --- 2.2 提取并准备CNN特征 ---
-            # [C, H, W] -> [1, C, H, W] -> [1, C_cnn, H, W]
-            cnn_feature_map = self.cnn_encoder(img_tensor.unsqueeze(0))
-            C_cnn, H_fm, W_fm = cnn_feature_map.shape[1:]
-
-            # 【修复点】使用与原始图像完全相同的Patch化逻辑
-            # [1, C_cnn, H, W] -> [1, N, P*P*C_cnn]
-            cnn_patches = cnn_feature_map.view(1, C_cnn, H_fm // pH, pH, W_fm // pW, pW).permute(0, 2, 4, 1, 3,
-                                                                                                 5).flatten(3)
-            cnn_patches = cnn_patches.flatten(1, 2)
-
-            # --- 2.3 融合两种特征 ---
-            raw_embed = self.x_embedder(raw_patches)  # [1, N, D]
-            cnn_embed = self.cnn_proj(cnn_patches)  # [1, N, D]
-
-            # 现在 raw_embed 和 cnn_embed 的Patch数量(N)完全相同，可以安全相加
-            fused_embed = raw_embed + cnn_embed  # [1, N, D]
-
-            list_of_fused_embeds.append(fused_embed.squeeze(0))
-
-        # --- 3. 将处理好的Patch序列填充为规整的批次张量 ---
-        padded_img_embed = torch.zeros(bsz, max_img_len, self.dim, device=device, dtype=list_of_fused_embeds[0].dtype)
-        padded_img_mask = torch.zeros(bsz, max_img_len, dtype=torch.bool, device=device)
-        for i in range(bsz):
-            img_len = l_effective_img_len[i]
-            padded_img_embed[i, :img_len] = list_of_fused_embeds[i]
-            padded_img_mask[i, :img_len] = True
-
-        # --- 4. 组装最终序列 (与父类逻辑保持一致) ---
-        max_seq_len = max((cap_len + img_len for cap_len, img_len in zip(l_effective_cap_len, l_effective_img_len)))
-        padded_full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=padded_img_embed.dtype)
-        mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
-
-        position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
-        for i in range(bsz):
-            cap_len = l_effective_cap_len[i]
-            img_len = l_effective_img_len[i]
-            H, W = original_img_sizes[i]
-            H_tokens, W_tokens = H // pH, W // pW
-            position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
-            position_ids[i, cap_len:cap_len + img_len, 0] = cap_len
-            row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
-            col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
-            position_ids[i, cap_len:cap_len + img_len, 1] = row_ids
-            position_ids[i, cap_len:cap_len + img_len, 2] = col_ids
-
-        freqs_cis = self.rope_embedder(position_ids)
-        cap_freqs_cis_shape = list(freqs_cis.shape);
-        cap_freqs_cis_shape[1] = cap_feats.shape[1]
-        cap_freqs_cis = torch.zeros(*cap_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
-        img_freqs_cis_shape = list(freqs_cis.shape);
-        img_freqs_cis_shape[1] = max_img_len
-        img_freqs_cis = torch.zeros(*img_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
-
-        for i in range(bsz):
-            cap_len = l_effective_cap_len[i];
-            img_len = l_effective_img_len[i]
-            cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
-            img_freqs_cis[i, :img_len] = freqs_cis[i, cap_len:cap_len + img_len]
-
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
-
-        for layer in self.noise_refiner:
-            padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, adaln_input)
-
-        for i in range(bsz):
-            cap_len = l_effective_cap_len[i];
-            img_len = l_effective_img_len[i]
-            mask[i, :cap_len + img_len] = True
-            padded_full_embed[i, :cap_len] = cap_feats[i, :cap_len]
-            padded_full_embed[i, cap_len:cap_len + img_len] = padded_img_embed[i, :img_len]
-
-        return padded_full_embed, mask, original_img_sizes, l_effective_cap_len, freqs_cis
 #############################################################################
 #                                 NextDiT Configs                           #
 #############################################################################

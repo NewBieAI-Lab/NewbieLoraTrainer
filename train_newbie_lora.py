@@ -61,6 +61,8 @@ class ImageCaptionDataset(Dataset):
         min_bucket_reso: int = 256,
         max_bucket_reso: int = 2048,
         bucket_reso_step: int = 64,
+        cache_refined_cap_feats: bool = False,
+        max_token_length: int = 512,
     ):
         self.train_data_dir = train_data_dir
         self.resolution = resolution
@@ -86,6 +88,8 @@ class ImageCaptionDataset(Dataset):
         self.min_bucket_reso = min_bucket_reso
         self.max_bucket_reso = max_bucket_reso
         self.bucket_reso_step = bucket_reso_step
+        self.cache_refined_cap_feats = cache_refined_cap_feats
+        self.max_token_length = max_token_length
 
         self._load_data()
         if self.enable_bucket:
@@ -162,6 +166,21 @@ class ImageCaptionDataset(Dataset):
             self.text_encoder.eval().to(self.device)
             self.clip_model.eval().to(self.device)
 
+            context_refiner = None
+            cap_embedder = None
+            rope_embedder = None
+            if self.cache_refined_cap_feats:
+                logger.info("Loading cap_embedder and context_refiner for refined cap_feats caching...")
+                from models.model import RopeEmbedder
+                cap_feat_dim = self.text_encoder.config.text_config.hidden_size
+                temp_model = models.NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP(
+                    in_channels=16, qk_norm=True, cap_feat_dim=cap_feat_dim,
+                    clip_text_dim=1024, clip_img_dim=1024
+                )
+                cap_embedder = temp_model.cap_embedder.eval().to(self.device)
+                context_refiner = temp_model.context_refiner.eval().to(self.device)
+                rope_embedder = RopeEmbedder(axes_dims=[32, 32, 32], axes_lens=[1024, 512, 512])
+
             with torch.no_grad():
                 for idx in tqdm(missing_indices, desc="Caching"):
                     image_path = self.image_paths[idx]
@@ -219,11 +238,34 @@ class ImageCaptionDataset(Dataset):
                             gemma_text = self.gemma3_prompt + caption if self.gemma3_prompt else caption
                             gemma_inputs = self.tokenizer(
                                 [gemma_text], padding=True, pad_to_multiple_of=8,
-                                truncation=True, max_length=512, return_tensors="pt"
+                                truncation=True, max_length=self.max_token_length, return_tensors="pt"
                             ).to(self.device)
                             gemma_outputs = self.text_encoder(**gemma_inputs, output_hidden_states=True)
-                            cap_feats = gemma_outputs.hidden_states[-2].squeeze(0).to(dtype=self.dtype).cpu()
-                            cap_mask = gemma_inputs.attention_mask.squeeze(0).cpu()
+                            cap_feats = gemma_outputs.hidden_states[-2].to(dtype=self.dtype)
+                            cap_mask = gemma_inputs.attention_mask
+
+                            if self.cache_refined_cap_feats:
+                                actual_len = cap_feats.shape[1]
+
+                                cap_feats = cap_embedder(cap_feats)
+
+                                if actual_len < self.max_token_length:
+                                    pad_len = self.max_token_length - actual_len
+                                    cap_feats = torch.cat([
+                                        cap_feats,
+                                        torch.zeros(1, pad_len, cap_feats.shape[-1], dtype=cap_feats.dtype, device=cap_feats.device)
+                                    ], dim=1)
+                                    cap_mask = torch.cat([
+                                        cap_mask,
+                                        torch.zeros(1, pad_len, dtype=cap_mask.dtype, device=cap_mask.device)
+                                    ], dim=1)
+
+                                position_ids = torch.zeros(1, self.max_token_length, 3, dtype=torch.int32, device=self.device)
+                                position_ids[0, :actual_len, 0] = torch.arange(actual_len, dtype=torch.int32, device=self.device)
+                                cap_freqs_cis = rope_embedder(position_ids)
+
+                                for layer in context_refiner:
+                                    cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
 
                             clip_inputs = self.clip_tokenizer(
                                 [caption], padding=True, truncation=True,
@@ -231,16 +273,28 @@ class ImageCaptionDataset(Dataset):
                             ).to(self.device)
                             clip_text_pooled = self.clip_model.get_text_features(**clip_inputs).squeeze(0).to(dtype=self.dtype).cpu()
 
-                        save_file({
-                            "cap_feats": cap_feats,
-                            "cap_mask": cap_mask,
-                            "clip_text_pooled": clip_text_pooled
-                        }, text_cache)
+                        if self.cache_refined_cap_feats:
+                            save_file({
+                                "cap_feats_refined": cap_feats.squeeze(0).cpu(),
+                                "cap_mask": cap_mask.squeeze(0).cpu(),
+                                "clip_text_pooled": clip_text_pooled
+                            }, text_cache)
+                        else:
+                            save_file({
+                                "cap_feats": cap_feats.squeeze(0).cpu(),
+                                "cap_mask": cap_mask.squeeze(0).cpu(),
+                                "clip_text_pooled": clip_text_pooled
+                            }, text_cache)
 
                     except Exception as e:
                         logger.error(f"Cache error for {image_path}: {e}")
 
             logger.info("Cache generation complete")
+            if self.cache_refined_cap_feats:
+                del cap_embedder, context_refiner, rope_embedder
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
         else:
             logger.info("All cache files found")
 
@@ -317,13 +371,24 @@ class ImageCaptionDataset(Dataset):
             vae_data = load_file(vae_cache)
             text_data = load_file(text_cache)
 
-            return {
-                "latents": vae_data['latents'],
-                "cap_feats": text_data['cap_feats'],
-                "cap_mask": text_data['cap_mask'],
-                "clip_text_pooled": text_data['clip_text_pooled'],
-                "cached": True,
-            }
+            if self.cache_refined_cap_feats:
+                return {
+                    "latents": vae_data['latents'],
+                    "cap_feats": text_data['cap_feats_refined'],
+                    "cap_mask": text_data['cap_mask'],
+                    "clip_text_pooled": text_data['clip_text_pooled'],
+                    "cached": True,
+                    "refined": True,
+                }
+            else:
+                return {
+                    "latents": vae_data['latents'],
+                    "cap_feats": text_data['cap_feats'],
+                    "cap_mask": text_data['cap_mask'],
+                    "clip_text_pooled": text_data['clip_text_pooled'],
+                    "cached": True,
+                    "refined": False,
+                }
         else:
             from PIL import Image
             try:
@@ -424,30 +489,41 @@ class BucketBatchSampler:
 
 def collate_fn(batch):
     if batch[0].get("cached", False):
-        max_cap_len = max(example["cap_feats"].shape[0] for example in batch)
+        if batch[0].get("refined", False):
+            return {
+                "latents": torch.stack([example["latents"] for example in batch]),
+                "cap_feats": torch.stack([example["cap_feats"] for example in batch]),
+                "cap_mask": torch.stack([example["cap_mask"] for example in batch]),
+                "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
+                "cached": True,
+                "refined": True,
+            }
+        else:
+            max_cap_len = max(example["cap_feats"].shape[0] for example in batch)
 
-        cap_feats_list = []
-        cap_mask_list = []
-        for example in batch:
-            cap_feat = example["cap_feats"]
-            cap_mask = example["cap_mask"]
-            current_len = cap_feat.shape[0]
+            cap_feats_list = []
+            cap_mask_list = []
+            for example in batch:
+                cap_feat = example["cap_feats"]
+                cap_mask = example["cap_mask"]
+                current_len = cap_feat.shape[0]
 
-            if current_len < max_cap_len:
-                pad_len = max_cap_len - current_len
-                cap_feat = torch.cat([cap_feat, torch.zeros(pad_len, cap_feat.shape[1], dtype=cap_feat.dtype)], dim=0)
-                cap_mask = torch.cat([cap_mask, torch.zeros(pad_len, dtype=cap_mask.dtype)], dim=0)
+                if current_len < max_cap_len:
+                    pad_len = max_cap_len - current_len
+                    cap_feat = torch.cat([cap_feat, torch.zeros(pad_len, cap_feat.shape[1], dtype=cap_feat.dtype)], dim=0)
+                    cap_mask = torch.cat([cap_mask, torch.zeros(pad_len, dtype=cap_mask.dtype)], dim=0)
 
-            cap_feats_list.append(cap_feat)
-            cap_mask_list.append(cap_mask)
+                cap_feats_list.append(cap_feat)
+                cap_mask_list.append(cap_mask)
 
-        return {
-            "latents": torch.stack([example["latents"] for example in batch]),
-            "cap_feats": torch.stack(cap_feats_list),
-            "cap_mask": torch.stack(cap_mask_list),
-            "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
-            "cached": True,
-        }
+            return {
+                "latents": torch.stack([example["latents"] for example in batch]),
+                "cap_feats": torch.stack(cap_feats_list),
+                "cap_mask": torch.stack(cap_mask_list),
+                "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
+                "cached": True,
+                "refined": False,
+            }
     else:
         return {
             "pixel_values": torch.stack([example["pixel_values"] for example in batch]),
@@ -702,18 +778,39 @@ def load_model_and_tokenizer(config):
 
 
 def setup_lora(model, config):
-    """应用 LoRA 到模型"""
     lora_rank = config['Model']['lora_rank']
     lora_alpha = config['Model']['lora_alpha']
     lora_target_modules = config['Model']['lora_target_modules']
     lora_dropout = config['Model'].get('lora_dropout', 0.05)
+    cache_refined = config['Model'].get('cache_refined_cap_feats', False)
+
+    modules_to_save = None
+    if cache_refined:
+        exclude_modules = [
+            "cap_embedder",
+            "context_refiner",
+        ]
+
+        filtered_modules = []
+        for module_pattern in lora_target_modules:
+            should_exclude = False
+            for exclude_pattern in exclude_modules:
+                if exclude_pattern in module_pattern:
+                    should_exclude = True
+                    break
+            if not should_exclude:
+                filtered_modules.append(module_pattern)
+
+        lora_target_modules = filtered_modules
+        logger.info(f"Refined cache enabled, excluding: {exclude_modules}")
 
     lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
         lora_dropout=lora_dropout,
-        bias="none"
+        bias="none",
+        modules_to_save=modules_to_save,
     )
 
     peft_model = get_peft_model(model, lora_config)
@@ -822,13 +919,13 @@ def get_tensors_summary(profiler_enabled=False):
 
 
 def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device, gemma3_prompt=""):
-    """计算 Rectified Flow 训练损失"""
     if batch.get("cached", False):
         latents = batch["latents"].to(device)
         cap_feats = batch["cap_feats"].to(device)
         cap_mask = batch["cap_mask"].to(device)
         clip_text_pooled = batch["clip_text_pooled"].to(device)
         batch_size = latents.shape[0]
+        use_refined = batch.get("refined", False)
     else:
         if vae is None or text_encoder is None or clip_model is None:
             raise RuntimeError("Models required for non-cached data but they are None. Enable cache or disable it in config.")
@@ -857,7 +954,9 @@ def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer
             scaling_factor = getattr(vae.config, 'scaling_factor', 0.13025)
             latents = latents * scaling_factor
 
-    model_kwargs = dict(cap_feats=cap_feats, cap_mask=cap_mask, clip_text_pooled=clip_text_pooled)
+        use_refined = False
+
+    model_kwargs = dict(cap_feats=cap_feats, cap_mask=cap_mask, clip_text_pooled=clip_text_pooled, use_refined_cap_feats=use_refined)
 
     loss_dict = transport.training_losses(model, latents, model_kwargs)
     return loss_dict["loss"].mean()
@@ -994,6 +1093,8 @@ def main():
                 device=accelerator.device,
                 dtype=cache_dtype,
                 gemma3_prompt=gemma3_prompt,
+                cache_refined_cap_feats=config['Model'].get('cache_refined_cap_feats', False),
+                max_token_length=config['Model'].get('max_token_length', 512),
             )
 
             logger.info("Cache generated, freeing encoders from GPU")
@@ -1020,6 +1121,8 @@ def main():
             device=accelerator.device,
             dtype=cache_dtype,
             gemma3_prompt=gemma3_prompt,
+            cache_refined_cap_feats=config['Model'].get('cache_refined_cap_feats', False),
+            max_token_length=config['Model'].get('max_token_length', 512),
         )
     else:
         model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer = load_model_and_tokenizer(config)
@@ -1037,6 +1140,8 @@ def main():
             device=accelerator.device,
             dtype=cache_dtype,
             gemma3_prompt=gemma3_prompt,
+            cache_refined_cap_feats=False,
+            max_token_length=config['Model'].get('max_token_length', 512),
         )
 
     # 创建 Rectified Flow transport
