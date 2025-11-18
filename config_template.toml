@@ -77,6 +77,13 @@ enable_bucket = true
 # 缓存文件保存在数据集同目录：图片.safetensors, 文本.txt.safetensors
 use_cache = true
 
+# 将缓存文件加载到内存（极速模式）
+# true: 训练前将所有缓存加载到 RAM，彻底消除磁盘 I/O 延迟
+# false: 每次从磁盘读取缓存文件
+# 内存需求：约 10MB × 图片数量（例如 1000 张图 ≈ 10GB RAM）
+# 推荐：如果内存充足（数据集 < 5000 张且 RAM > 64GB），启用此选项
+cache_in_memory = false
+
 # Gemma3 系统提示词（仅用于 Gemma3，不影响 Jina CLIP）
 gemma3_prompt = "You are an assistant designed to generate high-quality anime images with the highest degree of image-text alignment based on textual prompts. <Prompt Start>"
 

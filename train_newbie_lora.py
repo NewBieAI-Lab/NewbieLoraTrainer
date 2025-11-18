@@ -63,6 +63,7 @@ class ImageCaptionDataset(Dataset):
         bucket_reso_step: int = 64,
         cache_refined_cap_feats: bool = False,
         max_token_length: int = 512,
+        cache_in_memory: bool = False,
     ):
         self.train_data_dir = train_data_dir
         self.resolution = resolution
@@ -90,6 +91,8 @@ class ImageCaptionDataset(Dataset):
         self.bucket_reso_step = bucket_reso_step
         self.cache_refined_cap_feats = cache_refined_cap_feats
         self.max_token_length = max_token_length
+        self.cache_in_memory = cache_in_memory
+        self.memory_cache = {}
 
         self._load_data()
         if self.enable_bucket:
@@ -101,6 +104,30 @@ class ImageCaptionDataset(Dataset):
 
         if self.use_cache and vae is not None:
             self._prepare_cache()
+
+        if self.use_cache and self.cache_in_memory:
+            self._load_cache_to_memory()
+
+    def _load_cache_to_memory(self):
+        logger.info("Loading all cache files into memory...")
+        from safetensors.torch import load_file
+        import os
+        from tqdm import tqdm
+
+        for idx in tqdm(range(len(self.image_paths)), desc="Loading cache to RAM"):
+            image_path = self.image_paths[idx]
+            vae_cache = f"{image_path}.safetensors"
+            text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
+
+            vae_data = load_file(vae_cache)
+            text_data = load_file(text_cache)
+
+            self.memory_cache[idx] = {
+                'vae_data': vae_data,
+                'text_data': text_data
+            }
+
+        logger.info(f"Loaded {len(self.memory_cache)} cache files into memory")
 
     def _load_data(self):
         from PIL import Image
@@ -365,11 +392,16 @@ class ImageCaptionDataset(Dataset):
         bucket_reso = self.image_to_bucket.get(idx, (self.resolution, self.resolution))
 
         if self.use_cache:
-            vae_cache = f"{image_path}.safetensors"
-            text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
+            if self.cache_in_memory:
+                cached = self.memory_cache[idx]
+                vae_data = cached['vae_data']
+                text_data = cached['text_data']
+            else:
+                vae_cache = f"{image_path}.safetensors"
+                text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
 
-            vae_data = load_file(vae_cache)
-            text_data = load_file(text_cache)
+                vae_data = load_file(vae_cache)
+                text_data = load_file(text_cache)
 
             if self.cache_refined_cap_feats:
                 return {
@@ -1123,6 +1155,7 @@ def main():
             gemma3_prompt=gemma3_prompt,
             cache_refined_cap_feats=config['Model'].get('cache_refined_cap_feats', False),
             max_token_length=config['Model'].get('max_token_length', 512),
+            cache_in_memory=config['Model'].get('cache_in_memory', False),
         )
     else:
         model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer = load_model_and_tokenizer(config)
