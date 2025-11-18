@@ -950,12 +950,18 @@ def get_tensors_summary(profiler_enabled=False):
     logger.info(f"{'='*80}\n")
 
 
-def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device, gemma3_prompt=""):
+def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device, gemma3_prompt="", enable_profiling=False):
+    if enable_profiling:
+        from torch.profiler import record_function
+    else:
+        from contextlib import nullcontext as record_function
+
     if batch.get("cached", False):
-        latents = batch["latents"].to(device, non_blocking=True)
-        cap_feats = batch["cap_feats"].to(device, non_blocking=True)
-        cap_mask = batch["cap_mask"].to(device, non_blocking=True)
-        clip_text_pooled = batch["clip_text_pooled"].to(device, non_blocking=True)
+        with record_function("batch_to_device"):
+            latents = batch["latents"].to(device, non_blocking=True)
+            cap_feats = batch["cap_feats"].to(device, non_blocking=True)
+            cap_mask = batch["cap_mask"].to(device, non_blocking=True)
+            clip_text_pooled = batch["clip_text_pooled"].to(device, non_blocking=True)
         batch_size = latents.shape[0]
         use_refined = batch.get("refined", False)
     else:
@@ -988,10 +994,16 @@ def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer
 
         use_refined = False
 
-    model_kwargs = dict(cap_feats=cap_feats, cap_mask=cap_mask, clip_text_pooled=clip_text_pooled, use_refined_cap_feats=use_refined)
+    with record_function("prepare_model_kwargs"):
+        model_kwargs = dict(cap_feats=cap_feats, cap_mask=cap_mask, clip_text_pooled=clip_text_pooled, use_refined_cap_feats=use_refined)
 
-    loss_dict = transport.training_losses(model, latents, model_kwargs)
-    return loss_dict["loss"].mean()
+    with record_function("transport_training_losses"):
+        loss_dict = transport.training_losses(model, latents, model_kwargs)
+
+    with record_function("loss_mean"):
+        loss = loss_dict["loss"].mean()
+
+    return loss
 
 
 def save_checkpoint(accelerator, model, optimizer, scheduler, step, config):
@@ -1309,7 +1321,7 @@ def main():
                 ) as prof:
                     with record_function("forward"):
                         t0 = time.perf_counter()
-                        loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
+                        loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt, enable_profiling=True)
                         torch.cuda.synchronize()
                         step_timings["forward"] = time.perf_counter() - t0
 
@@ -1366,16 +1378,44 @@ def main():
                 logger.info(f"  CPU utilization: {(total_cpu_time / (total_time*1000)) * 100:.1f}%")
                 logger.info(f"  GPU utilization: {(total_gpu_time / (total_time*1000)) * 100:.1f}%")
 
+                logger.info("\n--- Forward Pass Breakdown (Top 30 operations) ---")
+                logger.info(f"{'Operation':<60s} {'Time (ms)':>12s} {'% of Fwd':>10s} {'Count':>8s}")
+                logger.info("-"*92)
+
+                forward_total = step_timings["forward"] * 1000
+                forward_events = sorted(
+                    [e for e in events if 'forward' in e.key.lower() and hasattr(e, 'self_device_time_total') and e.self_device_time_total > 0],
+                    key=lambda x: x.self_device_time_total, reverse=True
+                )[:30]
+
+                for evt in forward_events:
+                    pct = (evt.self_device_time_total / 1000) / forward_total * 100
+                    logger.info(f"{evt.key[:60]:<60s} {evt.self_device_time_total/1000:>12.2f} {pct:>9.1f}% {evt.count:>8d}")
+
+                logger.info("\n--- Backward Pass Breakdown (Top 30 operations) ---")
+                logger.info(f"{'Operation':<60s} {'Time (ms)':>12s} {'% of Bwd':>10s} {'Count':>8s}")
+                logger.info("-"*92)
+
+                backward_total = step_timings["backward"] * 1000
+                backward_events = sorted(
+                    [e for e in events if any(x in e.key.lower() for x in ['backward', 'grad', 'autograd']) and hasattr(e, 'self_device_time_total') and e.self_device_time_total > 0],
+                    key=lambda x: x.self_device_time_total, reverse=True
+                )[:30]
+
+                for evt in backward_events:
+                    pct = (evt.self_device_time_total / 1000) / backward_total * 100
+                    logger.info(f"{evt.key[:60]:<60s} {evt.self_device_time_total/1000:>12.2f} {pct:>9.1f}% {evt.count:>8d}")
+
                 logger.info("\n--- Detailed GPU Kernel Timing (Top 20) ---")
-                logger.info(f"{'Kernel Name':<60s} {'GPU Time (ms)':>15s} {'CPU Time (ms)':>15s} {'Count':>8s}")
-                logger.info("-"*100)
+                logger.info(f"{'Kernel Name':<60s} {'Device Time (ms)':>18s} {'CPU Time (ms)':>15s} {'Count':>8s}")
+                logger.info("-"*102)
 
                 events = prof.key_averages()
-                cuda_events = sorted([e for e in events if e.device_type.name == 'CUDA'],
-                                   key=lambda x: x.cuda_time_total, reverse=True)[:20]
+                cuda_events = sorted([e for e in events if hasattr(e, 'self_device_time_total') and e.self_device_time_total > 0],
+                                   key=lambda x: x.self_device_time_total, reverse=True)[:20]
 
                 for evt in cuda_events:
-                    logger.info(f"{evt.key[:60]:<60s} {evt.cuda_time_total/1000:>15.2f} {evt.cpu_time_total/1000:>15.2f} {evt.count:>8d}")
+                    logger.info(f"{evt.key[:60]:<60s} {evt.self_device_time_total/1000:>18.2f} {evt.cpu_time_total/1000:>15.2f} {evt.count:>8d}")
 
                 logger.info("\n--- Memory Usage ---")
                 if torch.cuda.is_available():
@@ -1388,21 +1428,21 @@ def main():
                 logger.info(f"{'Operation':<60s} {'CPU Time (ms)':>15s} {'Count':>8s}")
                 logger.info("-"*85)
 
-                cpu_events = sorted([e for e in events if e.device_type.name == 'CPU'],
-                                  key=lambda x: x.cpu_time_total, reverse=True)[:10]
+                cpu_events = sorted([e for e in events if hasattr(e, 'self_cpu_time_total') and e.self_cpu_time_total > 0],
+                                  key=lambda x: x.self_cpu_time_total, reverse=True)[:10]
 
                 for evt in cpu_events:
-                    logger.info(f"{evt.key[:60]:<60s} {evt.cpu_time_total/1000:>15.2f} {evt.count:>8d}")
+                    logger.info(f"{evt.key[:60]:<60s} {evt.self_cpu_time_total/1000:>15.2f} {evt.count:>8d}")
 
                 logger.info("\n--- Per-Operation Memory (Top 10) ---")
                 logger.info(f"{'Operation':<60s} {'Memory (MB)':>15s}")
                 logger.info("-"*77)
 
-                mem_events = sorted([e for e in events if e.cuda_memory_usage != 0],
-                                  key=lambda x: abs(x.cuda_memory_usage), reverse=True)[:10]
+                mem_events = sorted([e for e in events if hasattr(e, 'self_cuda_memory_usage') and e.self_cuda_memory_usage != 0],
+                                  key=lambda x: abs(x.self_cuda_memory_usage), reverse=True)[:10]
 
                 for evt in mem_events:
-                    mem_mb = evt.cuda_memory_usage / 1024**2
+                    mem_mb = evt.self_cuda_memory_usage / 1024**2
                     logger.info(f"{evt.key[:60]:<60s} {mem_mb:>15.2f}")
 
                 logger.info("\n" + "="*80)
