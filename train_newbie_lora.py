@@ -289,8 +289,13 @@ class ImageCaptionDataset(Dataset):
             self.buckets[closest_bucket].append(idx)
             self.image_to_bucket[idx] = closest_bucket
 
-        bucket_info = {k: len(v) for k, v in self.buckets.items() if len(v) > 0}
-        logger.info(f"Bucket assignment: {bucket_info}")
+        bucket_counts_with_repeats = {}
+        for bucket_reso, indices in self.buckets.items():
+            if len(indices) > 0:
+                total_with_repeats = sum(self.repeats[idx] for idx in indices)
+                bucket_counts_with_repeats[bucket_reso] = total_with_repeats
+
+        logger.info(f"Bucket assignment (with repeats): {bucket_counts_with_repeats}")
 
         if ar_errors:
             import numpy as np
