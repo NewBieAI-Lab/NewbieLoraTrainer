@@ -688,6 +688,17 @@ class NextDiT(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
 
+        # Gradient checkpointing
+        self.gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for this model."""
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for this model."""
+        self.gradient_checkpointing = False
+
     def unpatchify(
         self, x: torch.Tensor, img_size: List[Tuple[int, int]], cap_size: List[int], return_tensor=False
     ) -> List[torch.Tensor]:
@@ -821,7 +832,13 @@ class NextDiT(nn.Module):
         freqs_cis = freqs_cis.to(x.device)
 
         for layer in self.layers:
-            x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, mask, freqs_cis, adaln_input, attn_bias,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
 
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)
