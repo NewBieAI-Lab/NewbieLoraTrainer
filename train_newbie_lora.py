@@ -1285,19 +1285,138 @@ def main():
             global_step += 1
 
             if global_step == 1 and args.profiler:
-                print_memory_usage("Before first forward pass", args.profiler)
+                import time
+                from torch.profiler import profile, ProfilerActivity, record_function
+
+                logger.info("="*80)
+                logger.info("Starting detailed profiling for step 1...")
+                logger.info("="*80)
+
+                torch.cuda.synchronize()
+                step_timings = {}
+
+                t0 = time.perf_counter()
+                with record_function("data_transfer"):
+                    _ = batch["latents"].shape
+                torch.cuda.synchronize()
+                step_timings["data_transfer"] = time.perf_counter() - t0
+
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True
+                ) as prof:
+                    with record_function("forward"):
+                        t0 = time.perf_counter()
+                        loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
+                        torch.cuda.synchronize()
+                        step_timings["forward"] = time.perf_counter() - t0
+
+                    with record_function("backward"):
+                        t0 = time.perf_counter()
+                        accelerator.backward(loss)
+                        torch.cuda.synchronize()
+                        step_timings["backward"] = time.perf_counter() - t0
+
+                    with record_function("grad_clip"):
+                        t0 = time.perf_counter()
+                        if max_grad_norm > 0:
+                            accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        torch.cuda.synchronize()
+                        step_timings["grad_clip"] = time.perf_counter() - t0
+
+                    with record_function("optimizer"):
+                        t0 = time.perf_counter()
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        torch.cuda.synchronize()
+                        step_timings["optimizer"] = time.perf_counter() - t0
+
+                epoch_loss_sum += loss.detach()
+                epoch_loss_count += 1
+
+                total_time = sum(step_timings.values())
+
+                cpu_time_breakdown = {}
+                for evt in prof.key_averages():
+                    if evt.key in ["data_transfer", "forward", "backward", "grad_clip", "optimizer"]:
+                        cpu_time_breakdown[evt.key] = evt.cpu_time_total / 1000
+
+                logger.info("\n" + "="*80)
+                logger.info("PROFILING RESULTS - Step 1")
+                logger.info("="*80)
+                logger.info("\n--- High-Level Timing Breakdown ---")
+                logger.info(f"{'Operation':<20s} {'Wall Time (ms)':>15s} {'CPU Time (ms)':>15s} {'GPU Time (ms)':>15s} {'Percent':>10s}")
+                logger.info("-"*80)
+
+                for op_name, wall_time in step_timings.items():
+                    percentage = (wall_time / total_time) * 100
+                    cpu_time = cpu_time_breakdown.get(op_name, 0.0)
+                    gpu_time = wall_time * 1000 - cpu_time
+                    logger.info(f"{op_name:<20s} {wall_time*1000:>15.2f} {cpu_time:>15.2f} {gpu_time:>15.2f} {percentage:>9.1f}%")
+
+                logger.info("-"*80)
+                total_cpu_time = sum(cpu_time_breakdown.values())
+                total_gpu_time = sum(step_timings.values()) * 1000 - total_cpu_time
+                logger.info(f"{'TOTAL':<20s} {total_time*1000:>15.2f} {total_cpu_time:>15.2f} {total_gpu_time:>15.2f}")
+
+                logger.info(f"\n  Step throughput: {1.0/total_time:.2f} steps/sec")
+                logger.info(f"  CPU utilization: {(total_cpu_time / (total_time*1000)) * 100:.1f}%")
+                logger.info(f"  GPU utilization: {(total_gpu_time / (total_time*1000)) * 100:.1f}%")
+
+                logger.info("\n--- Detailed GPU Kernel Timing (Top 20) ---")
+                logger.info(f"{'Kernel Name':<60s} {'GPU Time (ms)':>15s} {'CPU Time (ms)':>15s} {'Count':>8s}")
+                logger.info("-"*100)
+
+                events = prof.key_averages()
+                cuda_events = sorted([e for e in events if e.device_type.name == 'CUDA'],
+                                   key=lambda x: x.cuda_time_total, reverse=True)[:20]
+
+                for evt in cuda_events:
+                    logger.info(f"{evt.key[:60]:<60s} {evt.cuda_time_total/1000:>15.2f} {evt.cpu_time_total/1000:>15.2f} {evt.count:>8d}")
+
+                logger.info("\n--- Memory Usage ---")
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    logger.info(f"  GPU Memory Allocated: {allocated:.2f} GB")
+                    logger.info(f"  GPU Memory Reserved:  {reserved:.2f} GB")
+
+                logger.info("\n--- CPU Operations (Top 10) ---")
+                logger.info(f"{'Operation':<60s} {'CPU Time (ms)':>15s} {'Count':>8s}")
+                logger.info("-"*85)
+
+                cpu_events = sorted([e for e in events if e.device_type.name == 'CPU'],
+                                  key=lambda x: x.cpu_time_total, reverse=True)[:10]
+
+                for evt in cpu_events:
+                    logger.info(f"{evt.key[:60]:<60s} {evt.cpu_time_total/1000:>15.2f} {evt.count:>8d}")
+
+                logger.info("\n--- Per-Operation Memory (Top 10) ---")
+                logger.info(f"{'Operation':<60s} {'Memory (MB)':>15s}")
+                logger.info("-"*77)
+
+                mem_events = sorted([e for e in events if e.cuda_memory_usage != 0],
+                                  key=lambda x: abs(x.cuda_memory_usage), reverse=True)[:10]
+
+                for evt in mem_events:
+                    mem_mb = evt.cuda_memory_usage / 1024**2
+                    logger.info(f"{evt.key[:60]:<60s} {mem_mb:>15.2f}")
+
+                logger.info("\n" + "="*80)
+                logger.info("Profiling complete. Exiting...")
+                logger.info("="*80 + "\n")
+
+                import sys
+                sys.exit(0)
 
             loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
             epoch_loss_sum += loss.detach()
             epoch_loss_count += 1
 
-            if global_step == 1 and args.profiler:
-                print_memory_usage("After first forward pass", args.profiler)
-
             accelerator.backward(loss)
-
-            if global_step == 1 and args.profiler:
-                print_memory_usage("After first backward pass", args.profiler)
 
             if max_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -1305,13 +1424,6 @@ def main():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-
-            if global_step == 1 and args.profiler:
-                print_memory_usage("After first optimizer step", args.profiler)
-                get_tensors_summary(args.profiler)
-                logger.info("Profiling complete for first step. You can now Ctrl+C to stop.")
-                import sys
-                sys.exit(0)
 
             if accelerator.is_main_process:
                 loss_value = loss.item()
