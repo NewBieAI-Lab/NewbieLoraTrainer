@@ -319,7 +319,7 @@ accelerate launch --multi_gpu train_newbie_lora.py --config_file my_config.toml
 
 ## 相关资源
 
-- [Newbie 模型](https://huggingface.co/Alpha-VLLM/Newbie)
+- [Newbie 模型](https://huggingface.co/NewBie-AI/NewBie-image-v0.1-exp-model-repo)
 - [Gemma3-4B-IT](https://huggingface.co/google/gemma-3-4b-it)
 - [Jina CLIP v2](https://huggingface.co/jinaai/jina-clip-v2)
 - [LoRA 论文](https://arxiv.org/abs/2106.09685)
