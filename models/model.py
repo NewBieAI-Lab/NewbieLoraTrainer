@@ -757,13 +757,17 @@ class NextDiT(nn.Module):
             C, H, W = x_batch.shape[1], x_batch.shape[2], x_batch.shape[3]
             x_patches = x_batch.view(bsz, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2)
 
+            # Optimized: Create position IDs without intermediate tensors
             row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
             col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 
-            img_position_ids = torch.zeros(bsz, img_len, 3, dtype=torch.int32, device=device)
-            img_position_ids[:, :, 0] = max_cap_len
-            img_position_ids[:, :, 1] = row_ids.unsqueeze(0).expand(bsz, -1)
-            img_position_ids[:, :, 2] = col_ids.unsqueeze(0).expand(bsz, -1)
+            # Stack position components efficiently
+            img_position_ids = torch.stack([
+                torch.full((img_len,), max_cap_len, dtype=torch.int32, device=device),
+                row_ids,
+                col_ids
+            ], dim=-1).unsqueeze(0).expand(bsz, -1, -1)
+
             img_freqs_cis = self.rope_embedder(img_position_ids)
 
             img_embed = self.x_embedder(x_patches)
@@ -772,16 +776,14 @@ class NextDiT(nn.Module):
             for layer in self.noise_refiner:
                 img_embed = layer(img_embed, img_mask, img_freqs_cis, t)
 
-            full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x_patches.dtype)
-            mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
+            # Optimized: Use torch.cat instead of creating zeros and filling
+            full_embed = torch.cat([cap_feats, img_embed], dim=1)
+            mask = torch.cat([cap_mask, img_mask], dim=1)
 
-            full_embed[:, :max_cap_len] = cap_feats
-            full_embed[:, max_cap_len:] = img_embed
-            mask[:, :max_cap_len] = cap_mask
-            mask[:, max_cap_len:] = True
-
-            freqs_cis = torch.zeros(bsz, max_seq_len, img_freqs_cis.shape[-1], device=device, dtype=img_freqs_cis.dtype)
-            freqs_cis[:, max_cap_len:] = img_freqs_cis
+            # Optimized: Create freqs_cis with cat, prepend zeros for caption positions
+            cap_freqs_zeros = torch.zeros(bsz, max_cap_len, img_freqs_cis.shape[-1],
+                                         device=device, dtype=img_freqs_cis.dtype)
+            freqs_cis = torch.cat([cap_freqs_zeros, img_freqs_cis], dim=1)
 
             return full_embed, mask, img_sizes, [max_cap_len] * bsz, freqs_cis
 
