@@ -925,13 +925,25 @@ class NextDiT(nn.Module):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        checkpoint_segments = 6
+        if self.gradient_checkpointing and self.training:
+            segment_size = len(self.layers) // checkpoint_segments
+            for seg_idx in range(checkpoint_segments):
+                start_idx = seg_idx * segment_size
+                end_idx = (seg_idx + 1) * segment_size if seg_idx < checkpoint_segments - 1 else len(self.layers)
+
+                def run_segment(start, end, x_in, mask_in, freqs_in, adaln_in, bias_in):
+                    x_out = x_in
+                    for idx in range(start, end):
+                        x_out = self.layers[idx](x_out, mask_in, freqs_in, adaln_in, bias_in)
+                    return x_out
+
                 x = torch.utils.checkpoint.checkpoint(
-                    layer, x, mask, freqs_cis, adaln_input, attn_bias,
+                    run_segment, start_idx, end_idx, x, mask, freqs_cis, adaln_input, attn_bias,
                     use_reentrant=False
                 )
-            else:
+        else:
+            for layer in self.layers:
                 x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
 
         x = self.final_layer(x, adaln_input)
@@ -1092,13 +1104,25 @@ class NextDiT_CLIP(NextDiT):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, adaln_input, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        checkpoint_segments = 6
+        if self.gradient_checkpointing and self.training:
+            segment_size = len(self.layers) // checkpoint_segments
+            for seg_idx in range(checkpoint_segments):
+                start_idx = seg_idx * segment_size
+                end_idx = (seg_idx + 1) * segment_size if seg_idx < checkpoint_segments - 1 else len(self.layers)
+
+                def run_segment(start, end, x_in, mask_in, freqs_in, adaln_in, bias_in):
+                    x_out = x_in
+                    for idx in range(start, end):
+                        x_out = self.layers[idx](x_out, mask_in, freqs_in, adaln_in, bias_in)
+                    return x_out
+
                 x = torch.utils.checkpoint.checkpoint(
-                    layer, x, mask, freqs_cis, adaln_input, attn_bias,
+                    run_segment, start_idx, end_idx, x, mask, freqs_cis, adaln_input, attn_bias,
                     use_reentrant=False
                 )
-            else:
+        else:
+            for layer in self.layers:
                 x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
 
         x = self.final_layer(x, adaln_input)
