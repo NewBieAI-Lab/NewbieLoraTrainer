@@ -80,6 +80,12 @@ train_batch_size = 1
 # 大数据集（>1000 张）：20-50
 num_epochs = 50
 
+# Checkpoint 保存间隔（按 Epoch）
+# 每隔多少个 epoch 保存一次检查点
+# 设置为 0 表示每个 epoch 都保存（默认）
+# 例如：5 表示每 5 个 epoch 保存一次
+save_epochs_interval = 0
+
 # 学习率
 # 这是 LoRA 训练最重要的超参数之一
 # 推荐范围：5e-5 ~ 2e-4

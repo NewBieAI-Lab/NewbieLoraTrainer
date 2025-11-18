@@ -724,7 +724,7 @@ def save_checkpoint(accelerator, model, optimizer, scheduler, step, config):
     checkpoint = {
         "step": step,
         "lora_state_dict": get_peft_model_state_dict(model),
-        "optimizer_state_dict": accelerator.get_state_dict(optimizer),
+        "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict()
     }
 
@@ -951,8 +951,10 @@ def main():
 
     start_time = datetime.now()
     max_grad_norm = config['Optimization'].get('gradient_clip_norm', 1.0)
+    save_epochs_interval = config['Model'].get('save_epochs_interval', 0)
 
     for epoch in range(config['Model']['num_epochs']):
+        epoch_losses = []
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch+1}/{config['Model']['num_epochs']}",
@@ -965,6 +967,7 @@ def main():
                 print_memory_usage("Before first forward pass", args.profiler)
 
             loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
+            epoch_losses.append(loss.item())
 
             if global_step == 1 and args.profiler:
                 print_memory_usage("After first forward pass", args.profiler)
@@ -1007,7 +1010,12 @@ def main():
             if global_step % 1000 == 0:
                 save_checkpoint(accelerator, model, optimizer, scheduler, global_step, config)
 
-        save_checkpoint(accelerator, model, optimizer, scheduler, global_step, config)
+        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        logger.info(f"Epoch {epoch+1}/{config['Model']['num_epochs']} completed - Average Loss: {avg_epoch_loss:.4f}")
+
+        if save_epochs_interval == 0 or (epoch + 1) % save_epochs_interval == 0:
+            save_checkpoint(accelerator, model, optimizer, scheduler, global_step, config)
+            logger.info(f"Checkpoint saved at epoch {epoch+1}")
 
     logger.info("Training complete, saving final model")
     save_lora_model(accelerator, model, config)
