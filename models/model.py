@@ -1011,7 +1011,13 @@ class NextDiT_CLIP(NextDiT):
         freqs_cis = freqs_cis.to(x.device)
 
         for layer in self.layers:
-            x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, mask, freqs_cis, adaln_input, attn_bias,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x, mask, freqs_cis, adaln_input, attn_bias)
 
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)
