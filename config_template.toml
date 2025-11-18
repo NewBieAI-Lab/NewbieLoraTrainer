@@ -134,6 +134,16 @@ lr_warmup_steps = 100
 # false: 禁用，速度快但显存占用大
 gradient_checkpointing = true
 
+# 梯度检查点分段数（仅在 gradient_checkpointing=true 时生效）
+# 模型有 36 层，分成多少段做 checkpoint
+# 分段越多 = 越省显存但越慢
+# 推荐值：
+#   - 18: 每 2 层 checkpoint（最省显存，OOM 时用这个）
+#   - 12: 每 3 层 checkpoint（平衡，推荐，默认）
+#   - 6:  每 6 层 checkpoint（较快，需要更多显存）
+#   - 4:  每 9 层 checkpoint（最快，显存充足时用）
+checkpoint_segments = 12
+
 # 混合精度训练
 # 可选值：
 #   - "no": 不使用混合精度（fp32），精度最高但显存占用最大

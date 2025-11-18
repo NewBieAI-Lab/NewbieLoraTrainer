@@ -925,7 +925,7 @@ class NextDiT(nn.Module):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
-        checkpoint_segments = 6
+        checkpoint_segments = getattr(self, 'checkpoint_segments', 12)
         if self.gradient_checkpointing and self.training:
             segment_size = len(self.layers) // checkpoint_segments
             for seg_idx in range(checkpoint_segments):
@@ -1104,7 +1104,7 @@ class NextDiT_CLIP(NextDiT):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, adaln_input, use_refined_cap_feats)
         freqs_cis = freqs_cis.to(x.device)
 
-        checkpoint_segments = 6
+        checkpoint_segments = getattr(self, 'checkpoint_segments', 12)
         if self.gradient_checkpointing and self.training:
             segment_size = len(self.layers) // checkpoint_segments
             for seg_idx in range(checkpoint_segments):

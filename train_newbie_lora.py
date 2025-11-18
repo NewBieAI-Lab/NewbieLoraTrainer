@@ -692,6 +692,9 @@ def load_transformer_only(config):
             model = model.to(dtype=model_dtype)
             logger.info(f"Model converted to {model_dtype}")
 
+    model.checkpoint_segments = config['Model'].get('checkpoint_segments', 12)
+    logger.info(f"Gradient checkpoint segments: {model.checkpoint_segments}")
+
     model.train()
     logger.info(f"Transformer loaded: {model.parameter_count():,} params, cap_feat_dim={cap_feat_dim}")
 
