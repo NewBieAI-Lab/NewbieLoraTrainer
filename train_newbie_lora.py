@@ -1378,6 +1378,8 @@ def main():
                 logger.info(f"  CPU utilization: {(total_cpu_time / (total_time*1000)) * 100:.1f}%")
                 logger.info(f"  GPU utilization: {(total_gpu_time / (total_time*1000)) * 100:.1f}%")
 
+                events = prof.key_averages()
+
                 logger.info("\n--- Forward Pass Breakdown (Top 30 operations) ---")
                 logger.info(f"{'Operation':<60s} {'Time (ms)':>12s} {'% of Fwd':>10s} {'Count':>8s}")
                 logger.info("-"*92)
@@ -1410,7 +1412,6 @@ def main():
                 logger.info(f"{'Kernel Name':<60s} {'Device Time (ms)':>18s} {'CPU Time (ms)':>15s} {'Count':>8s}")
                 logger.info("-"*102)
 
-                events = prof.key_averages()
                 cuda_events = sorted([e for e in events if hasattr(e, 'self_device_time_total') and e.self_device_time_total > 0],
                                    key=lambda x: x.self_device_time_total, reverse=True)[:20]
 
