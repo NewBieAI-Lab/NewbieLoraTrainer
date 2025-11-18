@@ -178,7 +178,7 @@ def load_model_and_tokenizer(config):
         with open(config_path, 'r') as f:
             model_config = json.load(f)
 
-        cap_feat_dim = text_encoder.config.hidden_size
+        cap_feat_dim = text_encoder.config.text_config.hidden_size
         model_name = model_config.get('_class_name', 'NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP')
 
         model = models.__dict__[model_name](
@@ -219,7 +219,7 @@ def load_model_and_tokenizer(config):
         clip_model = AutoModel.from_pretrained(clip_path, torch_dtype=torch.float32, trust_remote_code=True)
         clip_tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
 
-        cap_feat_dim = text_encoder.config.hidden_size
+        cap_feat_dim = text_encoder.config.text_config.hidden_size
         model = models.NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP(
             in_channels=16, qk_norm=True, cap_feat_dim=cap_feat_dim,
             clip_text_dim=1024, clip_img_dim=1024
