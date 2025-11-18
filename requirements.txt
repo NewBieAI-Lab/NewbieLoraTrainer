@@ -1,6 +1,7 @@
 # PyTorch核心依赖
 torch>=2.0.0
 torchvision>=0.15.0
+torchdiffeq>=0.2.3  # 用于ODE求解（Rectified Flow采样）
 
 # Hugging Face生态系统
 diffusers>=0.27.0

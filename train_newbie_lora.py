@@ -20,8 +20,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed, DummyOptim, DummyScheduler
-from diffusers import AutoencoderKL, DiT2D, DiT3D, FlowMatchEulerDiscreteScheduler
+from accelerate.utils import set_seed
+from diffusers import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
