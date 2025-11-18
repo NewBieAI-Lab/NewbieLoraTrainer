@@ -1238,7 +1238,8 @@ def main():
             if hasattr(train_dataloader.batch_sampler, 'set_epoch'):
                 train_dataloader.batch_sampler.set_epoch(epoch)
 
-        epoch_losses = []
+        epoch_loss_sum = torch.tensor(0.0, device=accelerator.device)
+        epoch_loss_count = 0
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch+1}/{config['Model']['num_epochs']}",
@@ -1254,7 +1255,8 @@ def main():
                 print_memory_usage("Before first forward pass", args.profiler)
 
             loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
-            epoch_losses.append(loss.item())
+            epoch_loss_sum += loss.detach()
+            epoch_loss_count += 1
 
             if global_step == 1 and args.profiler:
                 print_memory_usage("After first forward pass", args.profiler)
@@ -1279,27 +1281,25 @@ def main():
                 sys.exit(0)
 
             if accelerator.is_main_process:
-                accelerator.log({"loss": loss.item(), "learning_rate": scheduler.get_last_lr()[0]}, step=global_step)
+                loss_value = loss.item()
+                accelerator.log({"loss": loss_value, "learning_rate": scheduler.get_last_lr()[0]}, step=global_step)
 
                 elapsed = datetime.now() - start_time
                 steps_in_session = global_step - session_start_step
                 steps_per_sec = steps_in_session / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
                 progress_bar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
+                    'loss': f'{loss_value:.4f}',
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}',
                     'speed': f'{steps_per_sec:.2f} steps/s'
                 })
 
-            if global_step % 100 == 0 or global_step == 1:
-                elapsed = datetime.now() - start_time
-                steps_in_session = global_step - session_start_step
-                steps_per_sec = steps_in_session / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
-                logger.info(f"Epoch {epoch+1}/{config['Model']['num_epochs']}, Step {global_step}/{num_training_steps}, Loss {loss.item():.4f}, LR {scheduler.get_last_lr()[0]:.7f}, Speed {steps_per_sec:.2f} steps/s")
+                if global_step % 100 == 0 or global_step == 1:
+                    logger.info(f"Epoch {epoch+1}/{config['Model']['num_epochs']}, Step {global_step}/{num_training_steps}, Loss {loss_value:.4f}, LR {scheduler.get_last_lr()[0]:.7f}, Speed {steps_per_sec:.2f} steps/s")
 
             if global_step % 1000 == 0:
                 save_checkpoint(accelerator, model, optimizer, scheduler, global_step, config)
 
-        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        avg_epoch_loss = (epoch_loss_sum / epoch_loss_count).item() if epoch_loss_count > 0 else 0.0
         logger.info(f"Epoch {epoch+1}/{config['Model']['num_epochs']} completed - Average Loss: {avg_epoch_loss:.4f}")
 
         if save_epochs_interval == 0 or (epoch + 1) % save_epochs_interval == 0:
