@@ -952,17 +952,17 @@ def get_tensors_summary(profiler_enabled=False):
 
 def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device, gemma3_prompt=""):
     if batch.get("cached", False):
-        latents = batch["latents"].to(device)
-        cap_feats = batch["cap_feats"].to(device)
-        cap_mask = batch["cap_mask"].to(device)
-        clip_text_pooled = batch["clip_text_pooled"].to(device)
+        latents = batch["latents"].to(device, non_blocking=True)
+        cap_feats = batch["cap_feats"].to(device, non_blocking=True)
+        cap_mask = batch["cap_mask"].to(device, non_blocking=True)
+        clip_text_pooled = batch["clip_text_pooled"].to(device, non_blocking=True)
         batch_size = latents.shape[0]
         use_refined = batch.get("refined", False)
     else:
         if vae is None or text_encoder is None or clip_model is None:
             raise RuntimeError("Models required for non-cached data but they are None. Enable cache or disable it in config.")
 
-        pixel_values = batch["pixel_values"].to(device)
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         captions = batch["captions"]
         batch_size = pixel_values.shape[0]
 
