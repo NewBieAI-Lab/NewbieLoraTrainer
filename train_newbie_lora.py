@@ -972,6 +972,7 @@ def main():
 
     logger.info("Training started")
     global_step = start_step
+    session_start_step = start_step
 
     if accelerator.is_main_process:
         accelerator.init_trackers(os.path.split(__file__)[-1].split(".")[0])
@@ -980,14 +981,24 @@ def main():
     max_grad_norm = config['Optimization'].get('gradient_clip_norm', 1.0)
     save_epochs_interval = config['Model'].get('save_epochs_interval', 0)
 
-    for epoch in range(config['Model']['num_epochs']):
+    steps_per_epoch = len(train_dataloader)
+    start_epoch = start_step // steps_per_epoch
+    steps_to_skip_in_first_epoch = start_step % steps_per_epoch
+
+    if start_step > 0:
+        logger.info(f"Resuming from epoch {start_epoch+1}, will skip {steps_to_skip_in_first_epoch} steps in first epoch")
+
+    for epoch in range(start_epoch, config['Model']['num_epochs']):
         epoch_losses = []
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch+1}/{config['Model']['num_epochs']}",
             disable=not accelerator.is_main_process
         )
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
+            if epoch == start_epoch and batch_idx < steps_to_skip_in_first_epoch:
+                continue
+
             global_step += 1
 
             if global_step == 1 and args.profiler:
@@ -1022,7 +1033,8 @@ def main():
                 accelerator.log({"loss": loss.item(), "learning_rate": scheduler.get_last_lr()[0]}, step=global_step)
 
                 elapsed = datetime.now() - start_time
-                steps_per_sec = global_step / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+                steps_in_session = global_step - session_start_step
+                steps_per_sec = steps_in_session / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
                 progress_bar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}',
@@ -1031,7 +1043,8 @@ def main():
 
             if global_step % 100 == 0 or global_step == 1:
                 elapsed = datetime.now() - start_time
-                steps_per_sec = global_step / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+                steps_in_session = global_step - session_start_step
+                steps_per_sec = steps_in_session / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
                 logger.info(f"Epoch {epoch+1}/{config['Model']['num_epochs']}, Step {global_step}/{num_training_steps}, Loss {loss.item():.4f}, LR {scheduler.get_last_lr()[0]:.7f}, Speed {steps_per_sec:.2f} steps/s")
 
             if global_step % 1000 == 0:

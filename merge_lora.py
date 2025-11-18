@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 from diffusers import AutoencoderKL
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 
@@ -31,17 +31,19 @@ def load_base_model(base_model_path: str, trust_remote_code: bool = True):
 
     text_encoder_path = os.path.join(base_model_path, "text_encoder")
     text_encoder = AutoModel.from_pretrained(text_encoder_path, torch_dtype=torch.float32, trust_remote_code=trust_remote_code)
-    tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
+    tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=trust_remote_code)
+    tokenizer.padding_side = "right"
 
     clip_model_path = os.path.join(base_model_path, "clip_model")
     clip_model = AutoModel.from_pretrained(clip_model_path, torch_dtype=torch.float32, trust_remote_code=True)
-    clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_path)
+    clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_path, trust_remote_code=True)
 
     transformer_path = os.path.join(base_model_path, "transformer")
     with open(os.path.join(transformer_path, "config.json"), 'r') as f:
         model_config = json.load(f)
 
-    cap_feat_dim = text_encoder.config.hidden_size
+    text_encoder_config = AutoConfig.from_pretrained(text_encoder_path, trust_remote_code=trust_remote_code)
+    cap_feat_dim = text_encoder_config.text_config.hidden_size
     model_name = model_config.get('_class_name', 'NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP')
 
     model = models.__dict__[model_name](
@@ -54,7 +56,12 @@ def load_base_model(base_model_path: str, trust_remote_code: bool = True):
 
     weight_path = os.path.join(transformer_path, "diffusion_pytorch_model.safetensors")
     if os.path.exists(weight_path):
-        model.load_state_dict(load_file(weight_path), strict=False)
+        state_dict = load_file(weight_path)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            logger.warning(f"Missing keys when loading base model: {len(missing_keys)}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys when loading base model: {len(unexpected_keys)}")
 
     vae_path = os.path.join(base_model_path, "vae")
     vae = AutoencoderKL.from_pretrained(
@@ -74,12 +81,16 @@ def merge_lora_weights(base_model_path: str, lora_path: str, output_path: str,
 
     model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer = load_base_model(base_model_path, trust_remote_code)
 
+    logger.info(f"Loading LoRA weights from: {lora_path}")
     try:
-        lora_model = PeftModel.from_pretrained(model, lora_path, torch_dtype=torch.float32)
+        lora_model = PeftModel.from_pretrained(model, lora_path)
+        logger.info("LoRA adapter loaded, merging weights...")
         merged_model = lora_model.merge_and_unload()
-        logger.info("LoRA weights merged")
+        logger.info("LoRA weights merged successfully")
     except Exception as e:
         logger.error(f"Failed to merge LoRA: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
     try:
