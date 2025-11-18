@@ -767,7 +767,15 @@ class NextDiT(nn.Module):
             position_ids[:, fixed_cap_len:, 2] = col_ids
 
             freqs_cis = self.rope_embedder(position_ids)
-            cap_freqs_cis = freqs_cis[:, :fixed_cap_len]
+
+            cap_freqs_cis_shape = list(freqs_cis.shape)
+            cap_freqs_cis_shape[1] = fixed_cap_len
+            cap_freqs_cis = torch.zeros(*cap_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
+
+            valid_mask = (cap_range < cap_lens).unsqueeze(-1).expand(-1, -1, freqs_cis.shape[-1])
+            cap_freqs_cis_temp = freqs_cis[:, :fixed_cap_len]
+            cap_freqs_cis = torch.where(valid_mask, cap_freqs_cis_temp, cap_freqs_cis)
+
             img_freqs_cis = freqs_cis[:, fixed_cap_len:]
 
             for layer in self.context_refiner:
