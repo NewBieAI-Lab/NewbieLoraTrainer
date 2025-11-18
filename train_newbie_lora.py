@@ -1164,6 +1164,7 @@ def main():
     print_memory_usage("After LoRA", args.profiler)
 
     num_workers = config['Model'].get('dataloader_num_workers', 4)
+    prefetch_factor = config['Model'].get('dataloader_prefetch_factor', 2)
     batch_size = config['Model']['train_batch_size']
 
     if config['Model'].get('enable_bucket', True):
@@ -1175,7 +1176,7 @@ def main():
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=True if num_workers > 0 else False,
-            prefetch_factor=2 if num_workers > 0 else None
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
     else:
         train_dataloader = DataLoader(
@@ -1186,7 +1187,7 @@ def main():
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=True if num_workers > 0 else False,
-            prefetch_factor=2 if num_workers > 0 else None
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
 
     optimizer = setup_optimizer(model, config)

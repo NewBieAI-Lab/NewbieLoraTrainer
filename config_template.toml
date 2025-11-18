@@ -54,9 +54,17 @@ resolution = 1024
 
 # DataLoader 工作线程数
 # 用于多线程预加载数据，显著提升训练速度
-# 推荐值：4-8（根据CPU核心数）
+# 推荐值：8-16（根据CPU核心数和GPU速度）
 # 注意：设置为0会导致单线程加载，GPU会空等数据
-dataloader_num_workers = 4
+# 启用 refined cache 后建议增加到 16 以匹配更快的 GPU 计算
+dataloader_num_workers = 16
+
+# DataLoader 预取因子
+# 每个 worker 预取的 batch 数量
+# 总预取 = num_workers × prefetch_factor
+# 推荐值：4-8，启用 refined cache 后建议 8
+# 注意：过大会占用更多内存
+dataloader_prefetch_factor = 8
 
 # 启用分辨率分桶（Resolution Bucketing）
 # true: 支持多种宽高比（1:1, 3:4, 4:3, 9:16, 16:9）
