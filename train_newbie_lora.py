@@ -161,14 +161,14 @@ class ImageCaptionDataset(Dataset):
                                 truncation=True, max_length=512, return_tensors="pt"
                             ).to(self.device)
                             gemma_outputs = self.text_encoder(**gemma_inputs, output_hidden_states=True)
-                            cap_feats = gemma_outputs.hidden_states[-2].squeeze(0).cpu()
+                            cap_feats = gemma_outputs.hidden_states[-2].squeeze(0).to(dtype=self.dtype).cpu()
                             cap_mask = gemma_inputs.attention_mask.squeeze(0).cpu()
 
                             clip_inputs = self.clip_tokenizer(
                                 [caption], padding=True, truncation=True,
                                 max_length=2048, return_tensors="pt"
                             ).to(self.device)
-                            clip_text_pooled = self.clip_model.get_text_features(**clip_inputs).squeeze(0).cpu()
+                            clip_text_pooled = self.clip_model.get_text_features(**clip_inputs).squeeze(0).to(dtype=self.dtype).cpu()
 
                         save_file({
                             "cap_feats": cap_feats,
