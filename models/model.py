@@ -735,6 +735,57 @@ class NextDiT(nn.Module):
         img_sizes = [(img.size(1), img.size(2)) for img in x]
         l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in img_sizes]
 
+        same_resolution = len(set(img_sizes)) == 1
+
+        if same_resolution:
+            H, W = img_sizes[0]
+            H_tokens, W_tokens = H // pH, W // pW
+            img_len = l_effective_img_len[0]
+
+            if isinstance(x, torch.Tensor):
+                x_batch = x
+            else:
+                x_batch = torch.stack(x, dim=0)
+
+            C, H, W = x_batch.shape[1], x_batch.shape[2], x_batch.shape[3]
+            x_patches = x_batch.view(bsz, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2)
+
+            cap_len_tensor = cap_mask.sum(dim=1, keepdim=True)
+            max_cap_len = cap_len_tensor.max().item()
+            max_seq_len = max_cap_len + img_len
+
+            position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
+            cap_range = torch.arange(max_cap_len, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
+            cap_mask_positions = (cap_range < cap_len_tensor).to(torch.int32)
+            position_ids[:, :max_cap_len, 0] = cap_range * cap_mask_positions
+
+            row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+
+            position_ids[:, max_cap_len:, 0] = cap_len_tensor.squeeze(1).unsqueeze(1)
+            position_ids[:, max_cap_len:, 1] = row_ids
+            position_ids[:, max_cap_len:, 2] = col_ids
+
+            freqs_cis = self.rope_embedder(position_ids)
+            cap_freqs_cis = freqs_cis[:, :cap_feats.shape[1]]
+            img_freqs_cis = freqs_cis[:, max_cap_len:max_cap_len+img_len]
+
+            for layer in self.context_refiner:
+                cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
+
+            img_embed = self.x_embedder(x_patches)
+            img_mask = torch.ones(bsz, img_len, dtype=torch.bool, device=device)
+
+            for layer in self.noise_refiner:
+                img_embed = layer(img_embed, img_mask, img_freqs_cis, t)
+
+            full_embed = torch.cat([cap_feats[:, :max_cap_len], img_embed], dim=1)
+
+            cap_len_range = torch.arange(max_seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            mask = cap_len_range < (cap_len_tensor + img_len)
+
+            return full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
+
         max_seq_len = max(
             (cap_len+img_len for cap_len, img_len in zip(l_effective_cap_len, l_effective_img_len))
         )
