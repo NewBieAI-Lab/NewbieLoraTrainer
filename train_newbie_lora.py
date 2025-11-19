@@ -896,11 +896,12 @@ def save_lora_model(accelerator, model, config, step=None):
         lora_state_dict = get_peft_model_state_dict(accelerator.unwrap_model(model))
 
         lora_config = accelerator.unwrap_model(model).peft_config['default']
+        target_modules = list(lora_config.target_modules) if isinstance(lora_config.target_modules, set) else lora_config.target_modules
         metadata = {
             "lora_rank": str(lora_config.r),
             "lora_alpha": str(lora_config.lora_alpha),
             "lora_dropout": str(lora_config.lora_dropout),
-            "lora_target_modules": json.dumps(lora_config.target_modules),
+            "lora_target_modules": json.dumps(target_modules),
             "bias": str(lora_config.bias),
             "base_model_name": config['Model'].get('base_model_path', ''),
             "learning_rate": str(config['Model'].get('learning_rate', 0.0001)),
