@@ -225,11 +225,7 @@ class ImageCaptionDataset(Dataset):
                             cap_feats = gemma_outputs.hidden_states[-2].squeeze(0).to(dtype=self.dtype).cpu()
                             cap_mask = gemma_inputs.attention_mask.squeeze(0).cpu()
 
-                            clip_inputs = self.clip_tokenizer(
-                                [caption], padding=True, truncation=True,
-                                max_length=2048, return_tensors="pt"
-                            ).to(self.device)
-                            clip_text_pooled = self.clip_model.get_text_features(**clip_inputs).squeeze(0).to(dtype=self.dtype).cpu()
+                            clip_text_pooled = self.clip_model.encode_text([caption], truncate_dim=1024).squeeze(0).to(dtype=self.dtype).cpu()
 
                         save_file({
                             "cap_feats": cap_feats,
@@ -847,11 +843,7 @@ def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer
             cap_feats = gemma_outputs.hidden_states[-2]
             cap_mask = gemma_inputs.attention_mask
 
-            clip_inputs = clip_tokenizer(
-                captions, padding=True, truncation=True,
-                max_length=2048, return_tensors="pt"
-            ).to(device)
-            clip_text_pooled = clip_model.get_text_features(**clip_inputs)
+            clip_text_pooled = clip_model.encode_text(captions, truncate_dim=1024)
 
             latents = vae.encode(pixel_values).latent_dist.sample()
             scaling_factor = getattr(vae.config, 'scaling_factor', 0.13025)
