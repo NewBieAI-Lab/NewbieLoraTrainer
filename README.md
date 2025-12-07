@@ -1,337 +1,166 @@
-# Newbie LoRA Trainer
+# Newbie Trainer
 
-A LoRA training tool specifically designed for the Newbie (NextDiT_CLIP 3B) model.
+`newbie trainer` is a training toolkit designed specifically for the **Newbie AI** ecosystem.  
+It supports parameter-efficient fine-tuning of Newbie base models and currently provides two training modes: **LoRA** and **LoKr**. The goal is to balance output quality with lower VRAM and compute requirements, so you can quickly get started on both local machines and servers.
+
+---
+
+## Project Overview
+
+The goal of this trainer is to provide Newbie AI users with a solution that is:
+
+- **Easy to use**: Complete training workflows via configuration files and simple command-line interfaces.
+- **Highly adapted**: Customized and optimized for Newbie model structures and characteristics.
+- **Extensible**: Friendly to secondary development and easy to integrate into your own pipelines (e.g., ComfyUI workflows, batch generation scripts, etc.).
+
+If you are already using Newbie inference models, this trainer will help you quickly fine-tune styles, characters, and artistic directions to build your own personalized models.
+
+---
 
 ## Features
 
-- Automatic detection and loading of Diffusers-format checkpoints
-- Dual text encoders (Gemma3-4B-IT + Jina CLIP v2)
-- Variable-resolution training (resolution bucketing)
-- VRAM optimization: gradient checkpointing, mixed precision, 8-bit optimizers
-- Speed optimization: FlashAttention-2 support
-- Resumable training: automatic detection and loading of checkpoints
-- Three LoRA injection strategies (for 16 GB / 24 GB / 40 GB+ VRAM)
+### 1. LoRA Training (Low-Rank Adaptation)
+
+- LoRA fine-tuning tailored for Newbie models.
+- Suitable for **limited VRAM** or **rapid experimentation** scenarios.
+- Achieves significant style or behavior changes with only a small number of additional parameters.
+
+### 2. LoKr Training (LoKr / LyCORIS)
+
+- Supports LoKr-based training to further improve parameter efficiency.
+- Reduces storage and loading overhead while maintaining representational power.
+- More suitable for users who frequently switch or combine multiple LoRA / LoKr adapters.
 
 ---
 
-## Directory Structure
+## Environment & Setup
 
-```
-NewbieLoraTrainer/
-├── models/                          # NextDiT_CLIP model architecture definitions
-├── transport/                       # Rectified Flow implementation
-├── train_newbie_lora.py            # Core training script
-├── merge_lora.py                   # LoRA weight merging utility
-├── convert_newbie_to_diffusers.py  # Model format conversion utility
-├── config_template.toml            # Configuration template
-├── requirements.txt                # Dependency list
-└── README.md                       # This document
-```
+The following steps assume a Python environment. It is recommended to use **Python 3.10+** and an NVIDIA GPU with CUDA support on Linux or Windows.
 
----
-
-## Quickstart
-
-### 1. Environment Setup
+### 1. Clone the Repository with Git
 
 ```bash
-# Create a virtual environment (conda recommended)
-conda create -n newbie-lora python=3.10
-conda activate newbie-lora
+git clone https://github.com/NewBieAI-Lab/NewbieLoraTrainer.git
+cd NewbieLoraTrainer
+```
 
-# Install PyTorch (CUDA 12.1)
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+### 2. Use venv to Manage a Virtual Environment (Recommended)
 
-# Install project dependencies
+Using `venv` isolates this project’s dependencies from your system Python environment and avoids conflicts between different projects.
+
+```bash
+# Create a virtual environment
+python -m venv venv
+
+# Activate the virtual environment
+# Windows
+venv\Scripts\activate
+
+# Linux / macOS
+source venv/bin/activate
+```
+
+### 3. Install PyTorch
+
+Please visit the official PyTorch website and choose the correct installation command according to your **CUDA version** and operating system.  
+For example (only an example, please adjust to your actual setup):
+
+```bash
+pip install torch torchvision
+```
+
+> Note: If you want GPU acceleration, make sure to install a PyTorch build with CUDA support.
+
+### 4. Install Flash-Attention and Triton
+
+To further improve training speed and VRAM efficiency, it is recommended to install **Flash-Attention** and **Triton**:
+
+```bash
+pip install flash-attn
+pip install triton
+```
+
+Please refer to the tutorials linked below or the official documentation of each project if you run into compilation or CUDA-related issues during installation.
+
+### 5. Install Project Dependencies
+
+After activating the virtual environment and installing PyTorch, install the remaining dependencies required by this project with:
+
+```bash
 pip install -r requirements.txt
-
-# Install 8-bit optimizer (recommended)
-pip install bitsandbytes>=0.42.0
 ```
 
-### 2. Model Conversion
-
-Before training, you must first convert the model to Diffusers format:
-
-```bash
-python convert_newbie_to_diffusers.py \
-    --checkpoint /path/to/consolidated.00-of-01.pth \
-    --gemma3 google/gemma-3-4b-it \
-    --jina jinaai/jina-clip-v2 \
-    --output ./newbie-diffusers \
-    --dtype bf16
-```
-
-### 3. Prepare Training Data
-
-```
-data/train/
-├── 10_character/        # Directory name: repeatCount_description
-│   ├── img1.jpg
-│   ├── img1.txt        # Corresponding text caption
-│   └── ...
-└── 5_style/
-    ├── img3.jpg
-    └── img3.txt
-```
-
-### 4. Configure Training Parameters
-
-```bash
-cp config_template.toml my_config.toml
-# Edit my_config.toml to set the model path and data path
-```
-
-Key configuration:
-
-```toml
-base_model_path = "./newbie-diffusers"
-train_data_dir = "./data/train"
-resolution = 1024
-lora_rank = 32
-lora_target_modules = ["attention.qkv", "attention.out", "feed_forward.w2", "time_text_embed.1", "clip_text_pooled_proj.1"]
-```
-
-### 5. Start Training
-
-```bash
-python train_newbie_lora.py --config_file my_config.toml
-```
-
-### 6. Merge LoRA
-
-```bash
-python merge_lora.py \
-    --base_model_path ./newbie-diffusers \
-    --lora_path ./output/my_lora \
-    --output_path ./output/merged_model
-```
+Once these steps are completed, your basic environment is ready and you can start LoRA / LoKr training following the tutorials.
 
 ---
 
-## Configuration Guide
+## Training Tutorials
 
-### LoRA Injection Strategies
+If this is your first time using the trainer, it is strongly recommended to read the following tutorial documents first.  
+They explain data preparation, configuration files, command-line examples, and more.
 
-#### Strategy 1: Minimal Injection (16 GB VRAM)
+- **Chinese Tutorial** (recommended for Chinese-speaking users):  
+  https://www.notion.so/Newbie-AI-lora-2b84f7496d81803db524f5fc4a9c94b9?source=copy_link
 
-```toml
-lora_target_modules = ["attention.qkv", "attention.out", "time_text_embed.1"]
-```
+- **English Tutorial** (for international / English-speaking users):  
+  https://www.notion.so/Newbie-AI-lora-training-tutorial-English-2c2e4ae984ab8177b312e318827657e6?source=copy_link
 
-Recommended settings:
-- resolution = 768
-- lora_rank = 16
-- num_epochs = 100
-- learning_rate = 5e-5
+The tutorials typically cover:
 
-#### Strategy 2: Balanced Injection (24 GB VRAM, default)
-
-```toml
-lora_target_modules = [
-    "attention.qkv",
-    "attention.out",
-    "feed_forward.w2",
-    "time_text_embed.1",
-    "clip_text_pooled_proj.1",
-]
-```
-
-Recommended settings:
-- resolution = 1024
-- lora_rank = 32
-- num_epochs = 50
-- learning_rate = 1e-4
-
-#### Strategy 3: Full Injection (40 GB+ VRAM)
-
-```toml
-lora_target_modules = [
-    "attention.qkv",
-    "attention.out",
-    "feed_forward.w1",
-    "feed_forward.w2",
-    "feed_forward.w3",
-    "time_text_embed.1",
-    "clip_text_pooled_proj.1",
-    "adaLN_modulation.1",
-    "cap_embedder.1",
-]
-```
-
-Recommended settings:
-- resolution = 1024
-- lora_rank = 64
-- train_batch_size = 2-4
-- num_epochs = 30-50
-- learning_rate = 2e-4
-
-### VRAM Configuration Reference
-
-| GPU Model | VRAM | batch_size | lora_rank | Strategy | Resolution |
-|----------|------|------------|-----------|----------|------------|
-| RTX 4060 Ti | 16 GB | 1 | 16 | Strategy 1 | 768 |
-| RTX 3090/4090 | 24 GB | 1 | 32 | Strategy 2 | 1024 |
-| A100 (40 GB) | 40 GB | 2-4 | 64 | Strategy 3 | 1024 |
-| A100 (80 GB) | 80 GB | 4-8 | 64 | Strategy 3 | 1536 |
-
-### Dataset Size Reference
-
-| Number of Images | Recommended Epochs | Learning Rate | lora_rank |
-|------------------|--------------------|---------------|-----------|
-| < 100 | 100-200 | 5e-5 | 16 |
-| 100-1000 | 50-100 | 1e-4 | 32 |
-| > 1000 | 20-50 | 2e-4 | 64 |
+- Detailed environment and dependency explanations  
+- How to prepare and tag your training dataset  
+- Example configuration files and parameter descriptions  
+- Common error patterns and troubleshooting tips  
 
 ---
 
-## Advanced Features
+## Using the Trained Results
 
-### Resuming from Checkpoints
+### 1. Merging LoRA with `merge_lora.py`
 
-Simply rerun the training command; the script will automatically load the latest checkpoint:
+After completing LoRA training, you can use the provided `merge_lora.py` script to merge the trained LoRA with a base model.  
+This produces a standalone merged model that can be used directly in environments without native LoRA support.  
+(LoKr merging is **not** supported yet.)
+
+Example command (for illustration only):
 
 ```bash
-python train_newbie_lora.py --config_file my_config.toml
+python merge_lora.py   --base_model /path/to/base/model   --lora_path /path/to/trained_lora.safetensors   --output_path /path/to/merged_model
 ```
 
-### Tuning Hyperparameters
+Please adjust paths and arguments in the script or command line according to your actual setup.
 
-**Learning rate scheduler**:
+### 2. Loading LoRA Directly in ComfyUI
 
-```toml
-lr_scheduler = "cosine"  # cosine/linear/constant
-lr_warmup_steps = 100
-```
+If you are using **ComfyUI**, you can load a trained LoRA directly through the **Newbie AI LoRA Loader node**, without merging the model beforehand.
 
-**Optimizer**:
+Typical workflow:
 
-```toml
-optimizer_type = "AdamW8bit"  # AdamW8bit/AdamW
-gradient_clip_norm = 1.0
-```
-
-**Mixed precision**:
-
-```toml
-mixed_precision = "bf16"  # bf16/fp16/no
-```
-
-**LoRA parameters**:
-
-```toml
-lora_rank = 32
-lora_alpha = 32
-lora_dropout = 0.05
-```
+1. Place the trained `.safetensors` LoRA file into ComfyUI’s `loras` directory (or your custom directory).
+2. Add the Newbie AI LoRA Loader node in your ComfyUI workflow.
+3. Select the corresponding LoRA file in the node.
+4. Connect it to your Newbie base model inference pipeline and start image generation.
 
 ---
 
-## FAQ
+## Acknowledgements (Thanks)
 
-### Q: Out of memory (OOM) on the GPU?
+The overall design and implementation of this trainer is heavily inspired by excellent open-source projects in the community, especially:
 
-Try the following steps in order:
-1. `train_batch_size = 1`
-2. `gradient_checkpointing = true`
-3. `optimizer_type = "AdamW8bit"`
-4. Use Strategy 1 (Minimal Injection)
-5. Set `resolution = 768` or `512`
-6. Set `lora_rank = 16`
+- [kohya-ss / sd-scripts](https://github.com/kohya-ss/sd-scripts)
 
-### Q: Training is slow?
-
-Possible optimizations:
-1. Set `use_flash_attention_2 = true`
-2. Set `mixed_precision = "bf16"`
-3. Increase `train_batch_size` (if VRAM allows)
-4. Check GPU utilization with `nvidia-smi`
-
-### Q: Loss is not decreasing?
-
-Check the following:
-1. Learning rate (recommended range: 5e-5 ~ 2e-4)
-2. Data quality (whether images and captions match)
-3. Number of training epochs (small datasets require more epochs)
-4. Whether the model path is correct
-
-### Q: Multi-GPU training?
-
-```bash
-# Automatically detect all GPUs
-python train_newbie_lora.py --config_file my_config.toml
-
-# Or use Accelerate
-accelerate launch --multi_gpu train_newbie_lora.py --config_file my_config.toml
-```
-
----
-
-## Technical Details
-
-### NextDiT_CLIP Architecture
-
-**Dual text encoders**:
-- Gemma3-4B-IT: primary text features (`cap_feats`), max_length = 512, using `hidden_states[-2]`
-- Jina CLIP v2: CLIP text features (`clip_text_pooled`), max_length = 2048
-
-**Key modules**:
-- `attention.qkv/out`: attention projections
-- `feed_forward.w1/w2/w3`: SwiGLU feed-forward network
-- `time_text_embed`: fusion of timestep and CLIP features
-- `clip_text_pooled_proj`: projection of pooled CLIP features
-- `adaLN_modulation`: adaptive layer normalization
-
-**Rectified Flow training**:
-- Objective: predict the velocity field
-- Loss: MSE on velocity prediction
-- Time-step sampling: uniform distribution + shift
-
-### Training Pipeline
-
-```
-1. Data loading → ImageCaptionDataset
-2. Model preparation → NextDiT_CLIP + Gemma3 + Jina CLIP + VAE
-3. LoRA injection → use PEFT to attach LoRA adapters to target modules
-4. Training loop:
-   - Text encoding: Gemma3 + Jina CLIP
-   - Image encoding: VAE → latents (×0.13025)
-   - Rectified Flow loss computation
-   - Backpropagation + gradient clipping
-   - Checkpoint saving
-```
-
-### VRAM Usage (1024×1024, batch_size=1, bf16)
-
-| Component | VRAM |
-|----------|------|
-| NextDiT_CLIP 3B (bf16) | ~6 GB |
-| Gemma3-4B-IT (fp32, eval) | ~8 GB |
-| Jina CLIP (fp32, eval) | ~2 GB |
-| VAE (fp32, eval) | ~1 GB |
-| LoRA adapters | ~50-200 MB |
-| Optimizer (8-bit) | ~1-2 GB |
-| Activations (checkpointed) | ~2-3 GB |
-| **Total** | **~20-23 GB** |
-
-Optimization tips:
-- Enable gradient checkpointing: −3 GB
-- Use 8-bit optimizer: −1 GB
-- Lower the resolution (1024 → 768): −2 GB
-- Use a more minimal injection strategy: −1 GB
-
----
-
-## Related Resources
-
-- [Newbie model](https://huggingface.co/NewBie-AI/NewBie-image-v0.1-exp-model-repo)
-- [Gemma3-4B-IT](https://huggingface.co/google/gemma-3-4b-it)
-- [Jina CLIP v2](https://huggingface.co/jinaai/jina-clip-v2)
-- [LoRA paper](https://arxiv.org/abs/2106.09685)
-- [Rectified Flow paper](https://arxiv.org/abs/2210.02747)
+The `newbie trainer` borrows ideas from this project in terms of training flow, parameter design, and parts of the code structure.  
+We would like to express our sincere thanks to kohya-ss and all contributors to sd-scripts.
 
 ---
 
 ## License
 
-Apache 2.0
+This project is released under the **Apache License 2.0**. Under the terms of this license, you are allowed to:
+
+- Freely use, modify, and distribute this project’s code.
+- Integrate it into your personal or commercial projects.
+
+For full details, please refer to the `LICENSE` file in this repository or the official Apache 2.0 license documentation.
+
+If you have extended or modified this project, we kindly encourage you to credit the original source in your documentation and consider contributing improvements back to the community to help grow the Newbie ecosystem.

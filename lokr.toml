@@ -1,0 +1,133 @@
+[Model]
+#模型加载路径，填写clip_model、text_encoder、transformer、vae、model_index.json所在的文件夹路径
+base_model_path = "D:/ai/newbei-comfyui/ComfyUI/models/diffusion_models/diffusers"
+
+# 是否信任远程代码（Gemma 和 CLIP 模型需要）
+trust_remote_code = true
+
+# 训练输出目录
+output_dir = "./output"
+
+# 输出的 LoRA 模型名称（最终保存为 output_dir/output_name/）
+output_name = "novelai清透感画风"
+
+#训练类型lycoris-lokr
+adapter_type = "lyco_lokr"
+
+# =============================================================================
+# 数据配置
+# =============================================================================
+# 训练数据目录
+# 支持 kohya_ss 风格：目录名格式为 "重复次数_描述"
+# 例如：data/train/10_character/ 表示该目录下的图像重复10次
+# 每张图像需要有对应的 .txt 文件作为文本描述
+train_data_dir = "G:/数据集/novelai清透感画风"
+
+# 训练图像分辨率
+#推荐1024
+resolution = 1024
+
+# DataLoader 工作线程数
+dataloader_num_workers = 8
+
+# 启用分辨率分桶（Resolution Bucketing）
+# true: 支持多种宽高比（1:1, 3:4, 4:3, 9:16, 16:9）
+# false: 所有图像都调整为正方形（resolution × resolution）
+enable_bucket = true
+
+# 启用数据缓存（推荐）
+# true: 预先缓存 VAE latents 和文本特征，大幅加速训练并节省显存
+# false: 每次实时编码（慢，但不占用磁盘空间）
+# 缓存文件保存在数据集同目录：图片.safetensors, 文本.txt.safetensors
+use_cache = true
+
+# Gemma3 系统提示词（仅用于 Gemma3，不影响 Jina CLIP）
+gemma3_prompt = "You are an assistant designed to generate high-quality anime images with the highest degree of image-text alignment based on textual prompts. <Prompt Start>"
+
+# =============================================================================
+# 训练超参数
+# =============================================================================
+# 批次大小（每次前向传播处理的图像数量）
+train_batch_size = 4
+
+# 训练轮数（遍历整个数据集的次数）
+num_epochs = 30
+
+# Checkpoint 保存间隔（按 Epoch）
+# 每隔多少个 epoch 保存一次检查点
+# 设置为 0 表示每个 epoch 都保存（默认）
+save_epochs_interval = 1
+
+# 学习率
+#默认推荐推荐1e-4和2e-4，可自行测试
+learning_rate = 1e-4
+
+# 学习率调度器（控制学习率在训练过程中的变化）
+# 可选值：
+#   - "constant": 恒定学习率，不变化
+#   - "cosine": 余弦退火，推荐，平滑下降
+#   - "linear": 线性衰减
+#   - "cosine_with_restarts": 带重启的余弦，用于长时间训练
+lr_scheduler = "cosine"
+
+# 学习率预热步数
+lr_warmup_steps = 0
+
+# 梯度检查点
+gradient_checkpointing = true
+
+# 混合精度训练
+# 可选值：
+#   - "no": 不使用混合精度（fp32），精度最高但显存占用最大
+#   - "fp16": Float16，兼容性好，适用于所有 GPU
+#   - "bf16": BFloat16，推荐，适用于 Ampere 及更新 GPU（RTX 30/40 系列，A100，H100）
+# 推荐：bf16（如果 GPU 支持）
+mixed_precision = "bf16"
+
+# =============================================================================
+# Lokr 配置
+# =============================================================================
+
+#lokr rank
+#推荐大于100000进入进入全维度训练
+lokr_rank = 114514
+
+#lokr rank
+#等于lokr rank
+lokr_alpha = 114514
+
+#训练norm层
+lokr_train_norm = true
+
+#无用
+lokr_dropout = 0.05
+lokr_rank_dropout = 0.0
+lokr_module_dropout = 0.0
+
+#lokr因子
+#推荐8
+lokr_factor = 8                      # -1 表示自动，正整数表示 Kronecker 分解因子
+
+lokr_target_modules = [
+    "attention.qkv",
+    "attention.out",
+    "feed_forward.w2",
+    "time_text_embed.1",
+    "clip_text_pooled_proj.1",
+]
+
+[Optimization]
+# 优化器类型
+# 可选值：
+#   - "AdamW": 标准 AdamW 优化器
+#   - "AdamW8bit": 8-bit AdamW 优化器（推荐）
+# AdamW8bit 可以显著减少显存占用（约 1-2 GB），几乎不影响训练效果
+# 需要安装 bitsandbytes 库：pip install bitsandbytes>=0.42.0
+optimizer_type = "AdamW8bit"
+
+# 梯度裁剪范数（Gradient Clipping）
+gradient_clip_norm = 1.0
+
+# FlashAttention-2 优化
+use_flash_attention_2 = true
+

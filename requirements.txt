@@ -1,32 +1,12 @@
-# PyTorch核心依赖
-torch>=2.0.0
-torchvision>=0.15.0
-torchdiffeq>=0.2.3  # 用于ODE求解（Rectified Flow采样）
-
-# Hugging Face生态系统
 diffusers>=0.27.0
 transformers>=4.38.0
 peft>=0.8.2
 accelerate>=0.27.0
-safetensors>=0.4.0  # 用于高效模型加载和保存
-
-# 优化相关库
-bitsandbytes>=0.42.0  # 用于8-bit优化器（可选，但推荐）
-# flash-attn>=2.5.8  # 用于FlashAttention-2加速（可选，需要手动编译）
-
-# 配置文件解析
+safetensors>=0.4.0  
+lycoris-lora>=3.4.0  
+bitsandbytes>=0.42.0
 toml>=0.10.2
-
-# 图像处理
 Pillow>=10.2.0
-
-# HuggingFace Hub
 huggingface-hub>=0.20.0
-
-# 可选依赖（推荐安装以获得更好的性能）
-cudnn>=8.9.0
-
-# 开发工具（可选）
-black>=24.2.0  # 代码格式化
-isort>=5.13.0  # 导入排序
-flake8>=7.0.0  # 代码检查
+torchdiffeq>=0.2.0
+timm

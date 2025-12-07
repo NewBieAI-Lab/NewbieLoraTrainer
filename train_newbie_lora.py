@@ -28,6 +28,11 @@ from peft import LoraConfig, get_peft_model, PeftModel, get_peft_model_state_dic
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
+try:
+    from lycoris.wrapper import LycorisNetwork
+except ImportError:
+    LycorisNetwork = None
+
 sys.path.insert(0, str(Path(__file__).parent))
 import models
 from transport import create_transport
@@ -247,29 +252,49 @@ class ImageCaptionDataset(Dataset):
     def _generate_buckets(self):
         max_reso = self.resolution
         max_tokens = (max_reso / 16) * (max_reso / 16)
+        max_area = max_reso * max_reso
 
         assert self.bucket_reso_step % 8 == 0, "bucket_reso_step must be divisible by 8"
         assert self.min_bucket_reso % 8 == 0, "min_bucket_reso must be divisible by 8"
         assert self.max_bucket_reso % 8 == 0, "max_bucket_reso must be divisible by 8"
 
-        resolutions = set()
+        aspect_ratios = [(1, 1), (3, 4), (4, 3), (9, 16), (16, 9)]
+        buckets = set()
 
-        w = self.min_bucket_reso
-        while w <= self.max_bucket_reso:
-            h = self.min_bucket_reso
-            while h <= self.max_bucket_reso:
-                if (w / 16) * (h / 16) <= max_tokens and w % 8 == 0 and h % 8 == 0:
-                    resolutions.add((w, h))
-                h += self.bucket_reso_step
-            w += self.bucket_reso_step
+        def quantize(value: int) -> int:
+            value = max(self.min_bucket_reso, min(self.max_bucket_reso, value))
+            value = max(self.bucket_reso_step, (value // self.bucket_reso_step) * self.bucket_reso_step)
+            return value
 
-        self.bucket_resolutions = sorted(list(resolutions), key=lambda x: x[0] / x[1])
+        for ar_w, ar_h in aspect_ratios:
+            scale = math.sqrt(max_area / (ar_w * ar_h))
+            width = int(scale * ar_w)
+            height = int(scale * ar_h)
 
+            width = quantize(width)
+            height = quantize(height)
+
+            # Reduce the dominant side if rounding pushed the area over the limit.
+            while width * height > max_area and (width > self.min_bucket_reso or height > self.min_bucket_reso):
+                if width >= height and width > self.min_bucket_reso:
+                    width = max(self.min_bucket_reso, width - self.bucket_reso_step)
+                elif height > self.min_bucket_reso:
+                    height = max(self.min_bucket_reso, height - self.bucket_reso_step)
+                else:
+                    break
+
+            buckets.add((width, height))
+
+        self.bucket_resolutions = sorted(list(buckets), key=lambda x: x[0] / x[1])
+        self.buckets = {}
         for reso in self.bucket_resolutions:
             self.buckets[reso] = []
 
-        logger.info(f"Generated {len(self.bucket_resolutions)} buckets with max {max_tokens:.0f} tokens")
-        logger.info(f"Example buckets: {self.bucket_resolutions[:5]} ... {self.bucket_resolutions[-5:]}")
+        logger.info(
+            f"Generated {len(self.bucket_resolutions)} fixed buckets with max {max_tokens:.0f} tokens "
+            f"and area limit {max_area}"
+        )
+        logger.info(f"Bucket resolutions: {self.bucket_resolutions}")
 
     def _assign_buckets(self):
         ar_errors = []
@@ -289,13 +314,8 @@ class ImageCaptionDataset(Dataset):
             self.buckets[closest_bucket].append(idx)
             self.image_to_bucket[idx] = closest_bucket
 
-        bucket_counts_with_repeats = {}
-        for bucket_reso, indices in self.buckets.items():
-            if len(indices) > 0:
-                total_with_repeats = sum(self.repeats[idx] for idx in indices)
-                bucket_counts_with_repeats[bucket_reso] = total_with_repeats
-
-        logger.info(f"Bucket assignment (with repeats): {bucket_counts_with_repeats}")
+        bucket_info = {k: len(v) for k, v in self.buckets.items() if len(v) > 0}
+        logger.info(f"Bucket assignment: {bucket_info}")
 
         if ar_errors:
             import numpy as np
@@ -381,6 +401,7 @@ class BucketBatchSampler:
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self._first_epoch_sorted = False
 
         self.bucket_to_indices = {}
         for idx in range(len(dataset)):
@@ -403,17 +424,22 @@ class BucketBatchSampler:
             if self.shuffle:
                 rng.shuffle(indices_copy)
 
+            area = bucket_reso[0] * bucket_reso[1]
             batch_count = math.ceil(len(indices_copy) / self.batch_size)
             for batch_index in range(batch_count):
                 start_idx = batch_index * self.batch_size
                 batch = indices_copy[start_idx:start_idx + self.batch_size]
-                bucket_batches.append(batch)
+                bucket_batches.append({"area": area, "batch": batch})
 
         if self.shuffle:
-            rng.shuffle(bucket_batches)
+            if not self._first_epoch_sorted:
+                bucket_batches.sort(key=lambda x: x["area"], reverse=True)
+                self._first_epoch_sorted = True
+            else:
+                rng.shuffle(bucket_batches)
 
-        for batch in bucket_batches:
-            yield batch
+        for entry in bucket_batches:
+            yield entry["batch"]
 
     def __len__(self):
         return sum(math.ceil(len(indices) / self.batch_size) for indices in self.bucket_to_indices.values())
@@ -702,10 +728,98 @@ def load_model_and_tokenizer(config):
 
 
 def setup_lora(model, config):
-    """应用 LoRA 到模型"""
-    lora_rank = config['Model']['lora_rank']
-    lora_alpha = config['Model']['lora_alpha']
-    lora_target_modules = config['Model']['lora_target_modules']
+    """Apply adapter (LoRA or LyCORIS LoKR) to model"""
+    adapter_type = str(config['Model'].get('adapter_type', 'lora')).lower()
+
+    # ====== LyCORIS LoKR 分支======
+    if adapter_type in {"lyco_lokr", "lycoris_lokr", "lokr", "lyco-lokr"}:
+        if LycorisNetwork is None:
+            raise ImportError("lycoris-lora is required for LyCORIS LoKR")
+
+        default_target_modules = [
+            "attention.qkv",
+            "attention.out",
+            "feed_forward.w2",
+            "time_text_embed.1",
+            "clip_text_pooled_proj.1",
+        ]
+
+
+        lokr_rank = config['Model'].get('lokr_rank', config['Model'].get('lora_rank'))
+        lokr_alpha = config['Model'].get('lokr_alpha', config['Model'].get('lora_alpha', lokr_rank))
+        lokr_target_modules = (
+            config['Model'].get('lokr_target_modules')
+            or config['Model'].get('lora_target_modules')
+            or default_target_modules
+        )
+        lokr_dropout = config['Model'].get('lokr_dropout', config['Model'].get('lora_dropout', 0.05))
+        lokr_rank_dropout = config['Model'].get('lokr_rank_dropout', 0.0)
+        lokr_module_dropout = config['Model'].get('lokr_module_dropout', 0.0)
+        lokr_factor = config['Model'].get('lokr_factor', -1)
+        lokr_train_norm = config['Model'].get('lokr_train_norm', False)
+        target_patterns = []
+        for name in lokr_target_modules:
+            if "*" in name or "?" in name:
+                target_patterns.append(name)
+            else:
+                target_patterns.append(f"*{name}")
+
+        LycorisNetwork.apply_preset({
+            "enable_conv": True,
+            "target_module": [],
+            "target_name": target_patterns,
+            "use_fnmatch": True,
+            "exclude_name": [],
+        })
+
+        network = LycorisNetwork(
+            model,
+            multiplier=1.0,
+            lora_dim=lokr_rank,
+            conv_lora_dim=lokr_rank,
+            alpha=lokr_alpha,
+            conv_alpha=lokr_alpha,
+            dropout=lokr_dropout,
+            rank_dropout=lokr_rank_dropout,
+            module_dropout=lokr_module_dropout,
+            network_module="lokr",
+            train_norm=lokr_train_norm,
+            factor=lokr_factor,
+        )
+        network.apply_to()
+        device = next(model.parameters()).device
+        network.to(device)
+
+
+        model._adapter_type = "lyco_lokr"
+        model._lycoris_network = network
+        model._adapter_rank = lokr_rank
+        model._adapter_alpha = lokr_alpha
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(
+            f"LyCORIS LoKR applied: {trainable_params/1e6:.2f}M/{total_params/1e6:.2f}M trainable "
+            f"({trainable_params/total_params*100:.2f}%)"
+        )
+        logger.info(f"  Target patterns: {target_patterns}")
+        logger.info(f"  LoKR rank={lokr_rank}, alpha={lokr_alpha}, train_norm={lokr_train_norm}")
+
+        return model
+
+
+    # ======lora分支======
+    default_target_modules = [
+        "attention.qkv",
+        "attention.out",
+        "feed_forward.w2",
+        "time_text_embed.1",
+        "clip_text_pooled_proj.1",
+    ]
+
+    lora_rank = config['Model'].get('lora_rank')
+    lora_alpha = config['Model'].get('lora_alpha', lora_rank)
+    lora_target_modules = config['Model'].get('lora_target_modules') or default_target_modules
     lora_dropout = config['Model'].get('lora_dropout', 0.05)
 
     lora_config = LoraConfig(
@@ -718,19 +832,33 @@ def setup_lora(model, config):
 
     peft_model = get_peft_model(model, lora_config)
 
+    # 同样给 LoRA 分支也挂 rank/alpha，后面存 metadata 时用
+    peft_model._adapter_type = "lora"
+    peft_model._adapter_rank = lora_rank
+    peft_model._adapter_alpha = lora_alpha
+
     trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in peft_model.parameters())
-    logger.info(f"LoRA applied: {trainable_params/1e6:.2f}M/{total_params/1e6:.2f}M trainable ({trainable_params/total_params*100:.2f}%)")
+    logger.info(
+        f"LoRA applied: {trainable_params/1e6:.2f}M/{total_params/1e6:.2f}M trainable "
+        f"({trainable_params/total_params*100:.2f}%)"
+    )
     logger.info(f"  Target modules: {lora_target_modules}")
+    logger.info(f"  LoRA rank={lora_rank}, alpha={lora_alpha}")
 
     return peft_model
 
 
 def setup_optimizer(model, config):
-    """设置优化器 (LoRA优化参数)"""
+    """Configure optimizer (supports LoRA/LyCORIS)"""
     optimizer_type = config['Optimization']['optimizer_type']
     learning_rate = config['Model']['learning_rate']
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    adapter_type = getattr(model, "_adapter_type", "lora")
+
+    if adapter_type == "lyco_lokr" and hasattr(model, "_lycoris_network"):
+        trainable_params = model._lycoris_network.prepare_optimizer_params(learning_rate)
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     adam_kwargs = {"lr": learning_rate, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01}
 
@@ -864,76 +992,146 @@ def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer
 
 
 def save_checkpoint(accelerator, model, optimizer, scheduler, step, config):
-    """保存训练检查点"""
+    """Save training checkpoint (支持 LoRA 和 LyCORIS LoKr)"""
     checkpoint_dir = os.path.join(config['Model']['output_dir'], "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
-
+    unwrapped = accelerator.unwrap_model(model)
+    adapter_type = getattr(unwrapped, "_adapter_type", "lora")
+    if adapter_type == "lyco_lokr":
+        lyco_net = getattr(unwrapped, "_lycoris_network", None)
+        if lyco_net is None:
+            raise RuntimeError("LyCORIS network not initialized")
+        adapter_state = {k: v.detach().cpu() for k, v in lyco_net.state_dict().items()}
+    else:
+        adapter_state = {
+            k: v.detach().cpu()
+            for k, v in get_peft_model_state_dict(unwrapped).items()
+        }
     checkpoint = {
         "step": step,
-        "lora_state_dict": get_peft_model_state_dict(model),
+        "adapter_type": adapter_type,      
+        "adapter_state_dict": adapter_state,        
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict()
+        "scheduler_state_dict": scheduler.state_dict(),
     }
-
     accelerator.save(checkpoint, checkpoint_path)
     logger.info(f"Checkpoint saved: {checkpoint_path}")
     save_lora_model(accelerator, model, config, step)
 
 
 def save_lora_model(accelerator, model, config, step=None):
-    """保存 LoRA 模型"""
+    """Save adapter weights（同时支持 LoRA 和 LyCORIS LoKr），两种都用“目录结构”保存"""
     output_dir = config['Model']['output_dir']
     output_name = config['Model']['output_name']
     os.makedirs(output_dir, exist_ok=True)
 
-    if step:
-        save_path = os.path.join(output_dir, f"{output_name}_step_{step}.safetensors")
-    else:
-        save_path = os.path.join(output_dir, f"{output_name}.safetensors")
+    unwrapped = accelerator.unwrap_model(model)
+    adapter_type = getattr(unwrapped, "_adapter_type", "lora")
+
+    # ===== LyCORIS LoKr 分支 =====
+    if adapter_type == "lyco_lokr":
+        lyco_net = getattr(unwrapped, "_lycoris_network", None)
+        if lyco_net is None:
+            raise RuntimeError("LyCORIS network not initialized")
+
+        # 和 LoRA 一样：建一个目录，而不是直接写 .safetensors 文件
+        save_dir = os.path.join(output_dir, f"{output_name}_step_{step}" if step else output_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 权重文件名也对齐 LoRA：adapter_model.safetensors
+        weights_path = os.path.join(save_dir, "adapter_model.safetensors")
+
+        if accelerator.is_main_process:
+            lokr_rank = config['Model'].get('lokr_rank', getattr(unwrapped, "_adapter_rank", None))
+            lokr_alpha = config['Model'].get('lokr_alpha', getattr(unwrapped, "_adapter_alpha", None))
+
+            # 写入 safetensors + metadata
+            metadata = {"adapter_type": "lyco_lokr"}
+            if lokr_rank is not None:
+                metadata["lora_rank"] = str(lokr_rank)
+            if lokr_alpha is not None:
+                metadata["lora_alpha"] = str(lokr_alpha)
+
+            lyco_net.save_weights(weights_path, dtype=None, metadata=metadata)
+            logger.info(
+                f"LyCORIS LoKr model saved: {weights_path} "
+                f"(adapter_type=lyco_lokr, rank={lokr_rank}, alpha={lokr_alpha})"
+            )
+
+            # adapter_config.json 也放在目录里，名字对齐 peft 风格
+            cfg = {
+                "adapter_type": "lyco_lokr",
+                "peft_type": "LYCORIS",
+                "lycoris_type": "lokr",
+            }
+            if lokr_rank is not None:
+                try:
+                    r = int(lokr_rank)
+                except Exception:
+                    r = lokr_rank
+                cfg["r"] = r
+                cfg["network_dim"] = r
+            if lokr_alpha is not None:
+                try:
+                    a = float(lokr_alpha)
+                except Exception:
+                    a = lokr_alpha
+                cfg["lora_alpha"] = a
+                cfg["network_alpha"] = a
+
+            json_path = os.path.join(save_dir, "adapter_config.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            logger.info(f"LoKr adapter_config.json saved: {json_path}")
+
+        return  # LoKr 保存完直接返回
+
+    # ===== LoRA 分支（保持原来的 save_pretrained 逻辑）=====
+    save_dir = os.path.join(output_dir, f"{output_name}_step_{step}" if step else output_name)
+
+    unwrapped.save_pretrained(
+        save_dir,
+        is_main_process=accelerator.is_main_process,
+        state_dict=accelerator.get_state_dict(model),
+    )
 
     if accelerator.is_main_process:
-        lora_state_dict = get_peft_model_state_dict(accelerator.unwrap_model(model))
-
-        lora_config = accelerator.unwrap_model(model).peft_config['default']
-        target_modules = list(lora_config.target_modules) if isinstance(lora_config.target_modules, set) else lora_config.target_modules
-        metadata = {
-            "lora_rank": str(lora_config.r),
-            "lora_alpha": str(lora_config.lora_alpha),
-            "lora_dropout": str(lora_config.lora_dropout),
-            "lora_target_modules": json.dumps(target_modules),
-            "bias": str(lora_config.bias),
-            "base_model_name": config['Model'].get('base_model_path', ''),
-            "learning_rate": str(config['Model'].get('learning_rate', 0.0001)),
-            "resolution": str(config['Model'].get('resolution', 1024)),
-        }
-
-        save_file(lora_state_dict, save_path, metadata=metadata)
-        logger.info(f"LoRA model saved: {save_path}")
+        logger.info(f"LoRA model saved: {save_dir}")
 
 
 def load_checkpoint(accelerator, model, optimizer, scheduler, config):
-    """从检查点加载训练状态"""
     checkpoint_dir = os.path.join(config['Model']['output_dir'], "checkpoints")
     if not os.path.exists(checkpoint_dir):
         logger.info("No checkpoint found, starting from scratch")
         return 0
-
-    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_") and f.endswith(".pt")]
+    checkpoints = [
+        f for f in os.listdir(checkpoint_dir)
+        if f.startswith("checkpoint_") and f.endswith(".pt")
+    ]
     if not checkpoints:
         logger.info("No checkpoint files found, starting from scratch")
         return 0
-
     checkpoints.sort(key=lambda x: int(x.split('_')[1].split('.')[0]), reverse=True)
     checkpoint_path = os.path.join(checkpoint_dir, checkpoints[0])
-
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-
+    unwrapped = accelerator.unwrap_model(model)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    set_peft_model_state_dict(model, checkpoint["lora_state_dict"])
+    adapter_type = checkpoint.get("adapter_type", getattr(unwrapped, "_adapter_type", "lora"))
+    adapter_state = checkpoint.get("adapter_state_dict") or checkpoint.get("lora_state_dict")
+    if adapter_state is None:
+        raise RuntimeError("No adapter_state_dict found in checkpoint")
+    if adapter_type == "lyco_lokr":
+        lyco_net = getattr(unwrapped, "_lycoris_network", None)
+        if lyco_net is None:
+            raise RuntimeError("LyCORIS network not initialized???")
+        lyco_net.load_state_dict(adapter_state)
+        logger.info("Loaded LyCORIS LoKr state dict from checkpoint")
+    else:
+        set_peft_model_state_dict(unwrapped, adapter_state)
+        logger.info("Loaded LoRA state dict from checkpoint")
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
     logger.info(f"Resumed from step {checkpoint['step']}")
     return checkpoint["step"]
 
@@ -947,6 +1145,11 @@ def main():
 
     with open(args.config_file, 'r', encoding='utf-8') as f:
         config = toml.load(f)
+
+    # 若配置缺少 Optimization 段，补默认值避免 KeyError
+    opt_cfg = config.setdefault('Optimization', {})
+    opt_cfg.setdefault('optimizer_type', 'AdamW')
+    opt_cfg.setdefault('use_flash_attention_2', False)
 
     output_dir = config['Model']['output_dir']
     os.makedirs(output_dir, exist_ok=True)
@@ -1010,7 +1213,8 @@ def main():
             )
 
             logger.info("Cache generated, freeing encoders from GPU")
-            del vae, text_encoder, clip_model
+            del dataset
+            del vae, text_encoder, clip_model, clip_tokenizer, tokenizer
             import gc
             gc.collect()
             torch.cuda.empty_cache()
